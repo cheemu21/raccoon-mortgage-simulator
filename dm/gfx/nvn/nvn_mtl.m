@@ -155,8 +155,8 @@ enum { ALLOC_SHARE = 64 };   // submissions one allocator serves before the next
 enum { SUB_FLIGHT_MAX = ALLOC_MAX * ALLOC_SHARE };
 static id<MTL4CommandAllocator> g_alloc4[ALLOC_MAX]; static int g_alloc_n, g_alloc_cur;   // Command allocator pool of the main submission: at start pick one the GPU has finished with, create a new one if there is none (wait only at the cap)
 static id<MTL4CommandAllocator> g_up_alloc4[3];
-static id<MTL4CommandAllocator> g_present_alloc4[3];
-static id<MTL4CommandBuffer> g_present_cb[3];
+static id<MTL4CommandAllocator> g_present_alloc4[6];
+static id<MTL4CommandBuffer> g_present_cb[6];
 static id<MTL4ArgumentTable> g_vt, g_ft, g_ct, g_up_ct, g_ot;   // g_ot: the object stage of a task / mesh draw (mesh_tasks_draw)
 static int g_vbuf_cache = 1;   // DM_NVN_VBUF_CACHE=0 restores the uncached path for A/B measurements
 static uint64_t g_vt_addr[31]; static uint32_t g_vt_valid;
@@ -164,13 +164,13 @@ static uint64_t g_ft_addr[31]; static uint32_t g_ft_valid;   // the fragment tab
 static void geo_mesh_ft_change(void);   // nvn_geometry.inc
 static uint64_t g_vbuf_resolve, g_vbuf_reuse, g_vbuf_set, g_vbuf_skip, g_vbuf_copies, g_vbuf_copy_bytes;   // copies: vertex streams at addresses not 4-byte aligned (vbuf_unaligned)
 static id<MTL4ArgumentTable> g_present_args;
-static id<MTLBuffer> g_present_uv[3];
-static uint64_t g_present_alloc_fence[3];
+static id<MTLBuffer> g_present_uv[6];
+static uint64_t g_present_alloc_fence[6];
 // Under g_pq_mu: per present allocator, the newest ticket its commit feedback reported done on the GPU. present_now resets an allocator only once this reaches the ticket that
 // last used it. g_pq_done is not that: every display-link callback sets it to ticket - 1 (the previous present was committed, not run) and a present that was not submitted sets
 // it to its own ticket. Waiting on g_pq_done, a display-link present never waited here: with three presents in flight, or two after a dropped frame, the allocator was reset
 // under a present the GPU had not run, and that present's drawable read back black (t_present_alloc; docs/reference/frame-rate.md)
-static uint64_t g_present_alloc_done[3];
+static uint64_t g_present_alloc_done[6];
 static pthread_mutex_t g_pq_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_pq_cv = PTHREAD_COND_INITIALIZER;
 static pthread_cond_t g_link_cv = PTHREAD_COND_INITIALIZER;
@@ -1012,6 +1012,13 @@ static void udc_selftest(void) {
         MLOG("UDC self-check %s %s %lux%lu first value %08x, values differing from it %lu / %lu", g_dev.name.UTF8String, depth ? "Depth32F_S8" : "RGBA8", (unsigned long)w, (unsigned long)h, px[0], (unsigned long)bad, (unsigned long)(w * h));
     }
 }
+// DM_BC_OPTIONAL=1: this build's BC textures were re-encoded (scripts/bntx_astc.py), so a GPU without BC formats runs it (mtl_init_once, tex_desc; main.m front_ios_device_check)
+static int mtl_bc_optional(void) { const char *e = getenv("DM_BC_OPTIONAL"); return e && *e && strcmp(e, "0"); }
+static int g_bc_recode; static void bc_recode_load(void);   // DM_BC_RECODE (tex_desc: BC textures recoded at pack time)
+// The recode tables' fingerprint version, from their magic (bc_recode_load): 2 (scripts/bntx_astc.py fingerprint()): SHA-256 over the width, the height and the whole storage; 1: FNV-1a
+// over the first 4096 bytes, which two textures of one size with the same first rows share (Animal Crossing's Nook Inc. logo took another texture's ASTC copy). Older images keep 1
+static int g_bc_fpv = 1;
+static void bcd_init(void); static int g_bcd_on;   // a GPU without BC formats: the decode kernel for the BC textures left (bcd_copy)
 static void mtl_init_once(void) {
     const char *vbc = getenv("DM_NVN_VBUF_CACHE"); g_vbuf_cache = !(vbc && !strcmp(vbc, "0"));
     const char *link = getenv("DM_PRESENT_LINK");
@@ -1057,7 +1064,14 @@ static void mtl_init_once(void) {
     }
     // BC textures are created and uploaded as BC, with no decompression path (dm/gfx/tex/README.md); without BC the first one aborts in Metal's descriptor validation mid-game
     // (GitHub issue #704: an iPhone 15, A16). The iOS front end refuses such a device before the launcher (main.m); this stops every other route at the device, with the reason
-    if (!g_dev.supportsBCTextureCompression) MDIE("the Metal device %s has no BC texture formats, which the games' textures use and the host does not decompress: an iPhone needs an A17 Pro or later, an iPad an M1 or later", g_dev.name.UTF8String);
+    // A build whose BC textures were re-encoded (DM_BC_OPTIONAL=1 in its env.txt; scripts/bntx_astc.py) runs on such a GPU: a BC texture left in it is not made (tex_desc)
+    if (!g_dev.supportsBCTextureCompression && !mtl_bc_optional()) MDIE("the Metal device %s has no BC texture formats, which the games' textures use and the host does not decompress: an iPhone needs an A17 Pro or later, an iPad an M1 or later", g_dev.name.UTF8String);
+    if (!g_dev.supportsBCTextureCompression) MLOG("the Metal device %s has no BC texture formats: this build's textures are re-encoded (DM_BC_OPTIONAL); a BC texture left in it is decoded on the GPU", g_dev.name.UTF8String);
+    g_bcd_on = !g_dev.supportsBCTextureCompression;
+    if (g_bcd_on) bcd_init();
+    { const char *rc = getenv("DM_BC_RECODE"); int on = rc && *rc && strcmp(rc, "0");   // scripts/bntx_astc.py --eac: BC4 snorm / BC6H float textures hold EAC blocks (nvn_fmt_mtl.c)
+      nvn_fmt_set_recode(on); g_bc_recode = on;
+      if (on) { MLOG("DM_BC_RECODE: BC4 snorm textures are made as EAC R11, BC6H float as EAC RG11 snorm, BC2 as EAC RG11, BC6H ufloat as ASTC 4x4 HDR (recoded at pack time)"); bc_recode_load(); } }
     { void crash_set_wait_dump(void (*fn)(void)); void mtl_wait_state_dump(void); crash_set_wait_dump(mtl_wait_state_dump); }
     g_alloc_n = 3;
     for (int i = 0; i < 3; i++) {
@@ -2160,8 +2174,18 @@ static inline id enc_b_begin(id cb) {
     return e; }
 static inline void enc_b_end(id e) { m4_end(e); }
 static inline void enc_b_copy_buffer(id e, id<MTLBuffer> s, NSUInteger so, id<MTLBuffer> d, NSUInteger doff, NSUInteger n) { [e copyFromBuffer:s sourceOffset:so toBuffer:d destinationOffset:doff size:n]; }
-static inline void enc_b_copy_buffer_texture(id e, id<MTLBuffer> s, NSUInteger so, NSUInteger row, NSUInteger img, MTLSize z, id<MTLTexture> d, NSUInteger sl, NSUInteger lv, MTLOrigin o) { [e copyFromBuffer:s sourceOffset:so sourceBytesPerRow:row sourceBytesPerImage:img sourceSize:z toTexture:d destinationSlice:sl destinationLevel:lv destinationOrigin:o]; }
-static inline void enc_b_copy_texture_buffer(id e, id<MTLTexture> s, NSUInteger sl, NSUInteger lv, MTLOrigin o, MTLSize z, id<MTLBuffer> d, NSUInteger doff, NSUInteger row, NSUInteger img) { [e copyFromTexture:s sourceSlice:sl sourceLevel:lv sourceOrigin:o sourceSize:z toBuffer:d destinationOffset:doff destinationBytesPerRow:row destinationBytesPerImage:img]; }
+// A GPU without BC formats (g_bcd_on): a BC texture is an uncompressed stand-in (tex_desc, bcd_tag), and every copy of BC blocks into it is a decode on the GPU (bcd_copy,
+// dm/gfx/msl/bcdec.metal) instead of a copy. Every upload ends in this copy (packaged uploads, buffer-to-texture copies, the BC alias copies). A copy out of a stand-in cannot
+// give the game BC blocks back: it is left out, with a red line (bcd_readback). g_bcd_on: declared with mtl_bc_optional
+static int bcd_fmt(id<MTLTexture> t);
+static void bcd_copy(id e, id<MTLBuffer> s, NSUInteger so, NSUInteger row, MTLSize z, id<MTLTexture> d, NSUInteger sl, NSUInteger lv, MTLOrigin o, int fmt);
+static void bcd_readback(id<MTLTexture> t);
+static inline void enc_b_copy_buffer_texture(id e, id<MTLBuffer> s, NSUInteger so, NSUInteger row, NSUInteger img, MTLSize z, id<MTLTexture> d, NSUInteger sl, NSUInteger lv, MTLOrigin o) {
+    int bf; if (g_bcd_on && (bf = bcd_fmt(d))) { bcd_copy(e, s, so, row, z, d, sl, lv, o, bf); return; }
+    [e copyFromBuffer:s sourceOffset:so sourceBytesPerRow:row sourceBytesPerImage:img sourceSize:z toTexture:d destinationSlice:sl destinationLevel:lv destinationOrigin:o]; }
+static inline void enc_b_copy_texture_buffer(id e, id<MTLTexture> s, NSUInteger sl, NSUInteger lv, MTLOrigin o, MTLSize z, id<MTLBuffer> d, NSUInteger doff, NSUInteger row, NSUInteger img) {
+    if (g_bcd_on && bcd_fmt(s)) { bcd_readback(s); return; }
+    [e copyFromTexture:s sourceSlice:sl sourceLevel:lv sourceOrigin:o sourceSize:z toBuffer:d destinationOffset:doff destinationBytesPerRow:row destinationBytesPerImage:img]; }
 // The same with a blit option: one plane of a combined depth / stencil texture (MTLBlitOptionDepthFromDepthStencil)
 static inline void enc_b_copy_buffer_texture_opt(id e, id<MTLBuffer> s, NSUInteger so, NSUInteger row, NSUInteger img, MTLSize z, id<MTLTexture> d, NSUInteger sl, NSUInteger lv, MTLOrigin o, MTLBlitOption opt) { [e copyFromBuffer:s sourceOffset:so sourceBytesPerRow:row sourceBytesPerImage:img sourceSize:z toTexture:d destinationSlice:sl destinationLevel:lv destinationOrigin:o options:opt]; }
 static inline void enc_b_copy_texture_buffer_opt(id e, id<MTLTexture> s, NSUInteger sl, NSUInteger lv, MTLOrigin o, MTLSize z, id<MTLBuffer> d, NSUInteger doff, NSUInteger row, NSUInteger img, MTLBlitOption opt) { [e copyFromTexture:s sourceSlice:sl sourceLevel:lv sourceOrigin:o sourceSize:z toBuffer:d destinationOffset:doff destinationBytesPerRow:row destinationBytesPerImage:img options:opt]; }
@@ -3043,6 +3067,8 @@ static void cb_commit(DmCommitFB *o, int end) {   // end: the submission ends wi
     cb_end(g_cb, nil);
     rec_commit(g_cb, o, end); g_cbgen++;
 }
+static _Atomic uint64_t g_gpu_busy_ns;   // the GPU time of every submission so far (their feedback: GPUEndTime - GPUStartTime), for the iOS performance HUD (front_ios.m)
+uint64_t mtl_gpu_busy_ns(void) { return atomic_load_explicit(&g_gpu_busy_ns, memory_order_relaxed); }
 uint64_t mtl_sub_commit(void) {
     if (g_tf_enc) tf_pass_end();   // the capture pass and the saves it holds (nvn_feedback.inc), before this submission's writes are counted
     lc_land();   // clears still waiting (the command list ends with them)
@@ -3078,6 +3104,7 @@ uint64_t mtl_sub_commit(void) {
     int lost_test = gpu_lost_test();
     [o addFeedbackHandler:^(id<MTL4CommitFeedback> cb) {
         gpu_tag_done(gpu_f, cb.GPUStartTime, cb.GPUEndTime);
+        if (cb.GPUStartTime > 0 && cb.GPUEndTime > cb.GPUStartTime) atomic_fetch_add_explicit(&g_gpu_busy_ns, (uint64_t)((cb.GPUEndTime - cb.GPUStartTime) * 1e9), memory_order_relaxed);
         if (ws_on()) ws_fb(fence, cb.GPUEndTime);
         uint64_t c0 = 0, c1 = 0; if (seg_ts()) { c0 = gpu_s_guest_ns(cb.GPUStartTime); c1 = gpu_s_guest_ns(cb.GPUEndTime); }
         if (cb.error) { atomic_store(&g_last_commit_error, 1); res_top_once(cb.error); static int n, nv; int victim = [cb.error.description containsString:@"InnocentVictim"]; if (victim ? nv++ < 1 : n++ < 8) MLOG("[RED] command buffer error details fence=%llu: %s | GPU %.3f→%.3f", (unsigned long long)fence, cb.error.description.UTF8String, cb.GPUStartTime, cb.GPUEndTime); if (!victim) MLOG("[RED] state of the failed submission fence=%llu: %s", (unsigned long long)fence, cctx.UTF8String); MLOG("[RED] command buffer execution error: %s", cb.error.localizedDescription.UTF8String); }
@@ -3227,7 +3254,7 @@ static BOOL obj_is_tex(id object) {
     return is_texture;
 }
 
-static int g_red_once[178];   // one past the highest key: a new key raises this, and the macro refuses to compile otherwise
+static int g_red_once[186];   // one past the highest key: a new key raises this, and the macro refuses to compile otherwise
 #define RED_ONCE(k, ...) do { _Static_assert((k) < sizeof g_red_once / sizeof *g_red_once, "a RED_ONCE key past g_red_once: raise its size"); if (!g_red_once[k]++) MLOG("[RED] " __VA_ARGS__); } while (0)
 // NVN vertex streams 0–15 → Metal vertex buffer slots: 0–13 go to 16–29 (30 is the constant fallback buffer), 14 and 15 to 14 and 15. Metal has only the 31 slots 0–30; translated shaders use only buffer(0) (the argument buffer),
 // and the host's own vertex functions read no vertex buffers. 13 Sentinels uses stream 15, and the old 16 + stream went out of range (Metal assertion: buffer index (31) must be < 31)
@@ -3255,6 +3282,28 @@ static int tex_need_pfv(MTLPixelFormat base, MTLPixelFormat view) {
     for (size_t i = 0; i < sizeof g_pfv_srgb / sizeof *g_pfv_srgb; i++)
         if ((base == g_pfv_srgb[i].a && view == g_pfv_srgb[i].b) || (base == g_pfv_srgb[i].b && view == g_pfv_srgb[i].a)) return 0;
     return 1;
+}
+// A view in a BC format over a texture that holds other blocks: the RomFS image's recoded textures (DM_BC_RECODE, scripts/bntx_astc.py: ETC2, EAC, ASTC copies) and the decode stand-ins of a
+// GPU without BC formats (bcd_standin) keep the game's BC format in their NVN description, and a game view of that format named Metal's BC format. Metal views only within a format's own
+// family and its validation aborts on any other ("source texture pixelFormat (MTLPixelFormatETC2_RGB8_sRGB) not compatible with texture view pixelFormat (MTLPixelFormatBC1_RGBA_sRGB)":
+// Tomodachi Life, a BC1 sRGB view of a BC1 sRGB texture made as ETC2 sRGB). The view takes the format the texture holds, in the view's sRGB-ness where that format has an sRGB twin
+static const pfv_pair g_pfv_held[] = {
+    {MTLPixelFormatRGBA8Unorm, MTLPixelFormatRGBA8Unorm_sRGB},
+    {MTLPixelFormatETC2_RGB8, MTLPixelFormatETC2_RGB8_sRGB},
+    {MTLPixelFormatASTC_4x4_LDR, MTLPixelFormatASTC_4x4_sRGB}, {MTLPixelFormatASTC_5x5_LDR, MTLPixelFormatASTC_5x5_sRGB}, {MTLPixelFormatASTC_6x6_LDR, MTLPixelFormatASTC_6x6_sRGB},
+    {MTLPixelFormatASTC_8x8_LDR, MTLPixelFormatASTC_8x8_sRGB},
+};
+static int pf_bc(MTLPixelFormat pf) { return pf >= MTLPixelFormatBC1_RGBA && pf <= MTLPixelFormatBC7_RGBAUnorm_sRGB; }
+static int pf_block(MTLPixelFormat pf) { return pf_bc(pf) || (pf >= MTLPixelFormatPVRTC_RGB_2BPP && pf <= MTLPixelFormatETC2_RGB8A1_sRGB) || (pf >= MTLPixelFormatASTC_4x4_sRGB && pf <= MTLPixelFormatASTC_12x12_HDR); }
+static MTLPixelFormat view_pf_held(MTLPixelFormat base, MTLPixelFormat view) {
+    // also the other way: a game texture kept in its own BC format (bc_recoded r 3) viewed through its NVN format's recoded mapping (EAC); two BC formats view each other as Metal allows
+    if (view == base || !pf_block(view) || !pf_block(base) || (pf_bc(view) && pf_bc(base))) return view;
+    int srgb = pf_srgb_linear(view) != MTLPixelFormatInvalid;
+    MTLPixelFormat r = base;
+    for (size_t i = 0; i < sizeof g_pfv_held / sizeof *g_pfv_held; i++)
+        if (base == g_pfv_held[i].a || base == g_pfv_held[i].b) { r = srgb ? g_pfv_held[i].b : g_pfv_held[i].a; break; }
+    static int noted; if (!noted++) MLOG("texture view in BC format %lu over a texture holding format %lu (recoded at pack time, or a decode stand-in): made in format %lu (first case)", (unsigned long)view, (unsigned long)base, (unsigned long)r);
+    return r;
 }
 // Cache tables on the replay hot path always use nvn_hmap (C hash, keys not boxed); the table stores CFBridgingRetain'ed objects, CFRelease'd on replace / delete
 static void hm_rel(void *v) { CFRelease(v); }   // hm_get_id, hm_put_id and hm_del_id are nvn_owner.h's
@@ -3559,9 +3608,168 @@ static int tex_2d_size_exceeds_limit(const tex_t *t) {
     // Apple10 raised the 2D limit to 32768. Keep the existing bounds for other targets.
     return size > 32768 || t->d.target != NVN_TEXTURE_TARGET_2D || ![g_dev supportsFamily:MTLGPUFamilyApple10];
 }
+// ---------- BC textures recoded at pack time (scripts/bntx_astc.py --eac; DM_BC_RECODE=1) ----------
+// Beyond the marker formats (nvn_fmt_mtl.c), two tables at the RomFS image's root name textures by the fingerprint of their storage: FNV-1a 64 of their width and height (u32 each)
+// and the first min(4096, level-0 blocks x 8) bytes of their storage, which the game loads from its files as they are.
+//   dm_bc1_etc2.tbl  BC1 textures whose storage holds ETC2 RGB8 blocks: made as ETC2 (sRGB as the texture is). BC1 has no unused label of its size, and the game's own texture
+//                    compressor may make BC1 (its user-made textures), so a BC1 texture is recoded only when its storage says so
+//   dm_bc_astc.bin   BC1 / BC4 textures neither ETC2 nor EAC holds within the converter's PSNR floor: their storage stays BC, and an ASTC copy of every level (the largest block that holds
+//                    it, 6x6 at most) is read from the image at upload instead (bc_side_upload). File-backed: nothing but the GPU texture is kept
+// Looked up only for a texture whose storage holds data when it is made (a packaged upload); a user-made texture is not in either table, so it stays the BC texture it is.
+#include "../../host/romfs_image.h"
+typedef struct __attribute__((packed)) { uint64_t fp, off; uint32_t fmt; uint16_t w, h; uint8_t bx, by, levels, srgb; } bcside_ent;
+_Static_assert(sizeof(bcside_ent) == 28, "dm_bc_astc.bin entry");
+int nvn_sparse_pool(const void *pool);   // hle_nvn.c
+static uint64_t *g_bc1_etc2; static size_t g_bc1_etc2_n;
+static bcside_ent *g_bcside; static size_t g_bcside_n; static uint64_t g_bcside_data; static int g_bcside_fd = -1;
+static void *bc_read_entry(romfs_img *m, const img_ent *e, size_t *n) {
+    void *p = e->b ? malloc((size_t)e->b) : NULL;
+    if (!p || !romfs_image_read(m->fd, p, (size_t)e->b, (off_t)e->a)) { free(p); return NULL; }
+    *n = (size_t)e->b; return p;
+}
+static void bc_recode_load(void) {
+    const char *path = getenv("DM_ROMFS"); romfs_img *m = path ? romfs_image_open(path) : NULL;
+    if (!m) { MLOG("[RED] DM_BC_RECODE: the RomFS image (DM_ROMFS) could not be read: no recode tables, recoded BC1 textures are drawn wrong"); return; }
+    for (uint64_t k = m->e[0].a; k < m->e[0].a + m->e[0].b && k < m->n; k++) {
+        const img_ent *e = &m->e[k]; const char *nm = m->names + e->name; size_t n = 0;
+        if (e->type != 1) continue;
+        if (e->nlen == 15 && !memcmp(nm, "dm_bc1_etc2.tbl", 15)) {
+            uint8_t *p = bc_read_entry(m, e, &n);
+            if (p && n >= 16 && (!memcmp(p, "DMBC1TB1", 8) || !memcmp(p, "DMBC1TB2", 8))) { uint64_t c; memcpy(&c, p + 8, 8); g_bc_fpv = p[7] - '0';
+                if (16 + c * 8 <= n && (g_bc1_etc2 = malloc(c * 8 + 8))) { memcpy(g_bc1_etc2, p + 16, c * 8); g_bc1_etc2_n = (size_t)c; } }
+            free(p);
+        } else if (e->nlen == 14 && !memcmp(nm, "dm_bc_astc.bin", 14) && e->b >= 16) {
+            uint8_t h[16];
+            if (romfs_image_read(m->fd, h, 16, (off_t)e->a) && (!memcmp(h, "DMBCAS01", 8) || !memcmp(h, "DMBCAS02", 8))) { uint32_t c; memcpy(&c, h + 8, 4); g_bc_fpv = h[7] - '0';
+                if (16 + (uint64_t)c * sizeof(bcside_ent) <= e->b && (g_bcside = malloc((size_t)c * sizeof(bcside_ent) + 32)) && romfs_image_read(m->fd, g_bcside, (size_t)c * sizeof(bcside_ent), (off_t)e->a + 16)) {
+                    g_bcside_n = c; g_bcside_data = e->a + 16 + (uint64_t)c * sizeof(bcside_ent); g_bcside_fd = dup(m->fd); } }
+        }
+    }
+    romfs_image_close(m);
+    MLOG("DM_BC_RECODE: %zu BC1 textures recoded as ETC2, %zu BC1 / BC4 textures with an ASTC copy in the image (fingerprints version %d)", g_bc1_etc2_n, g_bcside_n, g_bc_fpv);
+}
+static uint64_t bc_fingerprint(uint32_t w, uint32_t h, const uint8_t *s, size_t avail) {
+    if (g_bc_fpv >= 2) {
+        CC_SHA256_CTX c; uint8_t wh[8], md[CC_SHA256_DIGEST_LENGTH]; uint64_t x; memcpy(wh, &w, 4); memcpy(wh + 4, &h, 4);
+        CC_SHA256_Init(&c); CC_SHA256_Update(&c, wh, 8);
+        for (size_t o = 0; o < avail; o += 1u << 30) CC_SHA256_Update(&c, s + o, (CC_LONG)(avail - o < (1u << 30) ? avail - o : 1u << 30));
+        CC_SHA256_Final(md, &c); memcpy(&x, md, 8); return x;
+    }
+    size_t n = ((size_t)(w + 3) / 4) * ((h + 3) / 4) * 8; if (n > 4096) n = 4096; if (n > avail) n = avail;
+    uint64_t x = 0xcbf29ce484222325ull; uint8_t wh[8]; memcpy(wh, &w, 4); memcpy(wh + 4, &h, 4);
+    for (int i = 0; i < 8; i++) x = (x ^ wh[i]) * 0x100000001b3ull;
+    for (size_t i = 0; i < n; i++) x = (x ^ s[i]) * 0x100000001b3ull;
+    return x;
+}
+// What a packaged BC1 / BC4 texture is made as: 1 = ETC2 (its storage holds ETC2 blocks), 2 = an ASTC copy (*se), 0 = the BC texture it is. Cached per thread for the same texture
+// and storage, as tex_desc and pkg_upload_ both ask
+static int bc_recoded(const tex_t *t, const bcside_ent **se) {
+    static __thread const tex_t *ct; static __thread const void *cmem; static __thread uint64_t cser; static __thread int cr; static __thread const bcside_ent *cse;
+    *se = NULL;
+    // BC1 / BC4 unorm (ETC2, ASTC copies) and the marker formats (a texture of the game's own in one, named as kept: r 3, its own format; the converter's other textures in them are EAC)
+    int marker = nvn_fmt_recoded(t->d.format);
+    if (!g_bc_recode || (t->d.format != 0x42 && t->d.format != 0x46 && t->d.format != 0x49 && !(marker && g_bcside_n)) || t->d.target != 1 || !t->mem || !t->L.size || (t->pool && nvn_sparse_pool(t->pool))) return 0;
+    if (ct == t && cmem == t->mem && cser == t->serial) { *se = cse; return cr; }
+    uint64_t fp = bc_fingerprint(t->d.width, t->d.height, t->mem, (size_t)t->L.size); int r = 0; const bcside_ent *hit = NULL;
+    if (t->d.format != 0x49 && !marker && g_bc1_etc2_n) { size_t lo = 0, hi = g_bc1_etc2_n; while (lo < hi) { size_t mid = (lo + hi) / 2; if (g_bc1_etc2[mid] < fp) lo = mid + 1; else hi = mid; } if (lo < g_bc1_etc2_n && g_bc1_etc2[lo] == fp) r = 1; }
+    if (!r && g_bcside_n) { size_t lo = 0, hi = g_bcside_n; while (lo < hi) { size_t mid = (lo + hi) / 2; if (g_bcside[mid].fp < fp) lo = mid + 1; else hi = mid; }
+        if (lo < g_bcside_n && g_bcside[lo].fp == fp && g_bcside[lo].fmt == (uint32_t)t->d.format && g_bcside[lo].w == t->d.width && g_bcside[lo].h == t->d.height
+            && g_bcside[lo].levels == (t->d.levels ? t->d.levels : 1)) { r = g_bcside[lo].bx ? 2 : 3; hit = &g_bcside[lo]; } }   // bx 0: kept as it is, no copy
+    ct = t; cmem = t->mem; cser = t->serial; cr = r; cse = hit; *se = hit;
+    return r;
+}
+// ---------- BC textures on a GPU without BC formats (g_bcd_on; DM_BC_OPTIONAL): decoded stand-ins ----------
+// What is left as BC after the pack-time recodes (a user-made texture the game compresses itself, a BC1 array texture) is made in an uncompressed format of the same channels and
+// decoded on the GPU as its blocks are copied in (dm/gfx/msl/bcdec.metal). It costs the memory of the uncompressed format (4 bytes a texel for BC1-3 / BC7), so it is the last resort
+// the pack-time recodes leave to the few textures they cannot hold. BC6H is not decoded (the recode makes the game's own BC6H ASTC HDR)
+static char g_bcd_key, g_bcd_view_key;
+static id<MTLComputePipelineState> g_bcd_pso; static id<MTL4ArgumentTable> g_bcd_ct; static id<MTLBuffer> g_bcd_par; static _Atomic size_t g_bcd_par_at;
+static os_unfair_lock g_bcd_lk = OS_UNFAIR_LOCK_INIT;   // the argument table's bindings are taken at the dispatch: one encode at a time
+static _Atomic uint64_t g_bcd_n, g_bcd_texels;
+static MTLPixelFormat bcd_standin(int f) {   // the stand-in of NVN BC format f, 0 for none
+    switch (f) {
+        case 0x41: case 0x42: case 0x43: case 0x44: case 0x4d: return MTLPixelFormatRGBA8Unorm;
+        case 0x45: case 0x46: case 0x47: case 0x48: case 0x4e: return MTLPixelFormatRGBA8Unorm_sRGB;
+        case 0x49: return MTLPixelFormatR8Unorm; case 0x4a: return MTLPixelFormatR8Snorm;
+        case 0x4b: return MTLPixelFormatRG8Unorm; case 0x4c: return MTLPixelFormatRG8Snorm;
+        default: return MTLPixelFormatInvalid;
+    }
+}
+static int bcd_kind(int f, int *sn) {   // bcdec.metal's fmt: 1 BC1, 2 BC2, 3 BC3, 4 BC4, 5 BC5, 7 BC7
+    *sn = f == 0x4a || f == 0x4c;
+    return f == 0x41 || f == 0x42 || f == 0x45 || f == 0x46 ? 1 : f == 0x43 || f == 0x47 ? 2 : f == 0x44 || f == 0x48 ? 3 : f == 0x49 || f == 0x4a ? 4 : f == 0x4b || f == 0x4c ? 5 : f == 0x4d || f == 0x4e ? 7 : 0;
+}
+static void bcd_tag(id<MTLTexture> mt, int f) {   // at each texture made from tex_desc: a stand-in remembers the BC format it holds
+    if (g_bcd_on && mt && bcd_standin(f) != MTLPixelFormatInvalid && mt.pixelFormat == bcd_standin(f) && !nvn_fmt_recoded(f)) objc_setAssociatedObject(mt, &g_bcd_key, @(f), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+static int bcd_fmt(id<MTLTexture> t) { NSNumber *n = t ? objc_getAssociatedObject(t, &g_bcd_key) : nil; return n ? n.intValue : 0; }
+static void bcd_init(void) {
+    NSError *e = nil; id<MTLLibrary> lib = host_msl_lib(g_dev, nil, "bcdec", &e); id<MTLFunction> fn = [lib newFunctionWithName:@"bcdec"];
+    g_bcd_pso = fn ? [g_dev newComputePipelineStateWithFunction:fn error:&e] : nil;
+    MTL4ArgumentTableDescriptor *atd = [MTL4ArgumentTableDescriptor new]; atd.maxBufferBindCount = 3; atd.maxTextureBindCount = 1;
+    g_bcd_ct = [g_dev newArgumentTableWithDescriptor:atd error:&e];
+    g_bcd_par = [g_dev newBufferWithLength:1u << 20 options:MTLResourceStorageModeShared]; if (g_bcd_par) res_add(g_bcd_par);
+    if (!g_bcd_pso || !g_bcd_ct || !g_bcd_par) { MLOG("[RED] bcdec: the BC decode kernel could not be made (%s): BC textures left are not drawn", e ? e.localizedDescription.UTF8String : "?"); g_bcd_pso = nil; }
+    else MLOG("bcdec: the GPU has no BC formats; BC textures left after the pack-time recodes are decoded on the GPU into uncompressed stand-ins");
+}
+static void bcd_copy(id e, id<MTLBuffer> s, NSUInteger so, NSUInteger row, MTLSize z, id<MTLTexture> d, NSUInteger sl, NSUInteger lv, MTLOrigin o, int f) {
+    int sn = 0, k = bcd_kind(f, &sn);
+    if (!g_bcd_pso || !k || z.depth > 1 || d.textureType == MTLTextureType3D || (so & 3) || !s) {
+        static _Atomic int n; if (!atomic_fetch_add(&n, 1)) MLOG("[RED] bcdec: a copy of BC format %#x blocks into its stand-in (%lux%lux%lu, %s) is not decoded; the texture keeps what it held", f,
+            (unsigned long)z.width, (unsigned long)z.height, (unsigned long)z.depth, d.textureType == MTLTextureType3D ? "3D" : "unaligned or no kernel");
+        return;
+    }
+    id<MTLTexture> v = objc_getAssociatedObject(d, &g_bcd_view_key);
+    if (!v) {   // an integer view of the stand-in: the kernel writes the bytes as they read (sRGB and snorm alike)
+        MTLPixelFormat up = d.pixelFormat == MTLPixelFormatRGBA8Unorm || d.pixelFormat == MTLPixelFormatRGBA8Unorm_sRGB ? MTLPixelFormatRGBA8Uint
+                          : d.pixelFormat == MTLPixelFormatR8Unorm || d.pixelFormat == MTLPixelFormatR8Snorm ? MTLPixelFormatR8Uint : MTLPixelFormatRG8Uint;
+        NSUInteger slices = (d.textureType == MTLTextureTypeCube || d.textureType == MTLTextureTypeCubeArray ? 6 : 1) * d.arrayLength;
+        v = [d newTextureViewWithPixelFormat:up textureType:MTLTextureType2DArray levels:NSMakeRange(0, d.mipmapLevelCount) slices:NSMakeRange(0, slices)];
+        if (!v) { static _Atomic int n; if (!atomic_fetch_add(&n, 1)) MLOG("[RED] bcdec: no integer view of a %lu stand-in (type %lu)", (unsigned long)d.pixelFormat, (unsigned long)d.textureType); return; }
+        objc_setAssociatedObject(d, &g_bcd_view_key, v, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    struct { uint64_t row; uint32_t w, h, ox, oy, slice, level, fmt, sn; } p = {row, (uint32_t)z.width, (uint32_t)z.height, (uint32_t)o.x, (uint32_t)o.y, (uint32_t)sl, (uint32_t)lv, (uint32_t)k, (uint32_t)sn};
+    size_t po = atomic_fetch_add(&g_bcd_par_at, 64) % (g_bcd_par.length - 64);   // a ring of parameter blocks: one a dispatch, long reused only after the GPU is past it
+    po &= ~(size_t)63; memcpy((uint8_t *)g_bcd_par.contents + po, &p, sizeof p);
+    id<MTL4ComputeCommandEncoder> ce = e;
+    os_unfair_lock_lock(&g_bcd_lk);
+    [ce barrierAfterEncoderStages:MTLStageBlit | MTLStageDispatch beforeEncoderStages:MTLStageDispatch visibilityOptions:MTL4VisibilityOptionDevice];   // the blocks a copy before may have written
+    [ce setArgumentTable:g_bcd_ct]; [ce setComputePipelineState:g_bcd_pso];
+    [g_bcd_ct setAddress:s.gpuAddress + so atIndex:0]; [g_bcd_ct setAddress:g_bcd_par.gpuAddress + po atIndex:2]; [g_bcd_ct setTexture:v.gpuResourceID atIndex:0];
+    [ce dispatchThreads:MTLSizeMake((z.width + 3) / 4, (z.height + 3) / 4, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+    [ce barrierAfterEncoderStages:MTLStageDispatch beforeEncoderStages:MTLStageBlit | MTLStageDispatch visibilityOptions:MTL4VisibilityOptionDevice];   // and what reads it after
+    os_unfair_lock_unlock(&g_bcd_lk);
+    uint64_t n = atomic_fetch_add(&g_bcd_n, 1); atomic_fetch_add(&g_bcd_texels, (uint64_t)z.width * z.height);
+    if (n < 4 || (n & (n - 1)) == 0) MLOG("bcdec: %llu BC copies decoded (%llu texels), latest format %#x %lux%lu", (unsigned long long)n + 1, (unsigned long long)atomic_load(&g_bcd_texels), f, (unsigned long)z.width, (unsigned long)z.height);
+}
+static void bcd_readback(id<MTLTexture> t) {
+    static _Atomic int n; if (!atomic_fetch_add(&n, 1))
+        MLOG("[RED] bcdec: the game copies a BC texture (format %#x) out to memory, but on this GPU it is a decoded stand-in: the copy is left out (open: the game's own texture compressor's results are read back so)", bcd_fmt(t));
+}
+static MTLPixelFormat bc_side_pf(const bcside_ent *se) {   // the copy's ASTC format: 4x4, 5x5 or 6x6 (the converter's blocks), LDR or sRGB as the texture
+    int k = se->bx == 6 ? 4 : se->bx == 5 ? 2 : 0;
+    return (MTLPixelFormat)((se->srgb ? MTLPixelFormatASTC_4x4_sRGB : MTLPixelFormatASTC_4x4_LDR) + k);
+}
 static MTLTextureDescriptor *tex_desc(const tex_t *t, int packaged) {
     uint32_t pf = 0; uint8_t swz[4];
     if (!nvn_fmt_to_mtl(t->d.format, &pf, swz) || !pf) { RED_ONCE(0, "texture format %#x has no Metal equivalent (first case)", t->d.format); return nil; }
+    if (packaged && g_bc_recode) { const bcside_ent *se; int r = bc_recoded(t, &se);   // a BC1 texture recoded as ETC2, or a BC1 / BC4 one with an ASTC copy (above)
+        if (r == 1) pf = t->d.format == 0x46 ? MTLPixelFormatETC2_RGB8_sRGB : MTLPixelFormatETC2_RGB8;
+        else if (r == 2) pf = bc_side_pf(se);
+        else if (r == 3) { uint32_t own = 0; if (nvn_fmt_to_mtl_own(t->d.format, &own, NULL) && own) pf = own; } }   // the game's own texture in a marker format: its own format
+    // A GPU without BC formats running a build whose textures were re-encoded (DM_BC_OPTIONAL, mtl_init; scripts/bntx_astc.py, LumiOS-Platinum's astc_textures.py): a BC texture
+    // still left is made as its uncompressed stand-in and decoded as its blocks are copied in (bcd_copy); one with no stand-in (BC6H) or without the decode kernel is not made, as one
+    // of a format Metal lacks, so the default texture is bound where it is sampled, instead of Metal aborting in descriptor validation
+    int standin = 0;
+    if (pf >= MTLPixelFormatBC1_RGBA && pf <= MTLPixelFormatBC7_RGBAUnorm_sRGB && !g_dev.supportsBCTextureCompression) {
+        MTLPixelFormat sp = bcd_standin(t->d.format);
+        if (sp == MTLPixelFormatInvalid || !g_bcd_pso) {
+            RED_ONCE(178, "BC texture %u×%u format %#x on a GPU without BC formats: not made, the default texture is sampled (first case ser=%llu; %s)",
+                     t->d.width, t->d.height, t->d.format, (unsigned long long)t->serial, g_bcd_pso ? "no decoded stand-in for this format" : "no BC decode kernel");
+            return nil;
+        }
+        pf = (uint32_t)sp; standin = 1;
+    }
     // Catch dimensions that would cause Metal's descriptor validation to abort.
     if (tex_2d_size_exceeds_limit(t) || t->d.depth > 2048) { RED_ONCE(71, "texture size exceeds Metal limits: %u×%u×%u levels %u format %#x target %d (first case ser=%llu)", t->d.width, t->d.height, t->d.depth, t->d.levels, t->d.format, t->d.target, (unsigned long long)t->serial); return nil; }
     MTLTextureDescriptor *d = [MTLTextureDescriptor new];
@@ -3619,6 +3827,7 @@ static MTLTextureDescriptor *tex_desc(const tex_t *t, int packaged) {
     // of it (rt_view_upgrade), packing the bits in its shader. Nintendo Switch Sports Resort's NDSR upscaler input is one, made again at each new size of its dynamic resolution: without
     // this every one of them was upgraded (copied into a new texture) at its first pass, 27 in 80 s of its menus
     if (d.pixelFormat == MTLPixelFormatRGB9E5Float && (d.usage & MTLTextureUsageRenderTarget)) d.usage |= MTLTextureUsagePixelFormatView;
+    if (standin) d.usage |= MTLTextureUsageShaderWrite | MTLTextureUsagePixelFormatView;   // the decode writes it through an integer view (bcd_copy)
     return d;
 }
 // A level's size as its Metal texture holds it (tex_desc): width, rows, and depth planes (z may be NULL). A 1D (target 0) or 1D array (3) texture is one row; a 1D array's NVN
@@ -4321,10 +4530,28 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, id<MTLTexture
              (unsigned long long)(mt.allocatedSize >> 20), t->pool && nvn_sparse_pool(t->pool) ? ", in a sparse virtual pool" : t->pool && (t->pool->flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL) ? ", in a virtual pool" : ""); }
     if (g_allocprof > 0) { static int n; if (n++ < 30 || n % 500 == 0) MLOG("new texture (%s) #%d ser=%llu %ux%ux%u format %#x target %d levels %u storage %p", __func__, n, (unsigned long long)t->serial, t->d.width, t->d.height, t->d.depth, t->d.format, t->d.target, t->d.levels, (void *)t->mem); }
     res_add(mt);   // Both first upload and re-upload register residency here (Metal 4 does not make resources resident automatically; a missed registration = GPU address page fault)
+    bcd_tag(mt, t->d.format);   // a GPU without BC formats: a BC texture's stand-in, decoded as it is uploaded
     int sparse = t->pool && nvn_sparse_pool(t->pool);
     if (stamp) {   // no stamp: a one-time upload of content the CPU will not change (tex_init_fill), with no write tracking
         *stamp = nvn_dirty_now();
         if (sparse) nvn_sparse_protect(t->pool, (uint64_t)(uintptr_t)t->mem, t->L.size); else nvn_dirty_protect(t->mem, t->L.size); }
+    { const bcside_ent *se;   // DM_BC_RECODE: a BC1 / BC4 texture with an ASTC copy in the image is uploaded from the copy, every level, not from its BC storage (bc_recoded)
+      if (g_bc_recode && bc_recoded(t, &se) == 2 && mt.pixelFormat == bc_side_pf(se) && g_bcside_fd >= 0) {
+          up_begin();
+          size_t total = 0; for (unsigned l = 0; l < se->levels; l++) { uint32_t lw = MAX(t->d.width >> l, 1u), lh = MAX(t->d.height >> l, 1u); total += (size_t)((lw + se->bx - 1) / se->bx) * ((lh + se->by - 1) / se->by) * 16; }
+          id<MTLBuffer> stg = [g_dev newBufferWithLength:total ? total : 16 options:MTLResourceStorageModeShared];
+          if (stg && romfs_image_read(g_bcside_fd, stg.contents, total, (off_t)(g_bcside_data + se->off))) {
+              res_add(stg); [g_up_keep addObject:stg]; g_bp_up_bytes += total;
+              size_t off = 0;
+              for (unsigned l = 0; l < se->levels && l < d.mipmapLevelCount; l++) {
+                  uint32_t lw = MAX(t->d.width >> l, 1u), lh = MAX(t->d.height >> l, 1u); size_t row = (size_t)((lw + se->bx - 1) / se->bx) * 16, rows = (lh + se->by - 1) / se->by;
+                  up_blit_add(stg, off, row, row * rows, MTLSizeMake(lw, lh, 1), mt, 0, l); off += row * rows;
+              }
+              [g_up_texs addObject:mt]; up_flush();
+              return mt;
+          }
+          RED_ONCE(179, "DM_BC_RECODE: the ASTC copy of texture ser=%llu %ux%u could not be read from the image; it is uploaded from its storage", (unsigned long long)t->serial, t->d.width, t->d.height);
+      } }
     int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
     unsigned layers = (t->d.target == 4 || t->d.target == 9) ? t->d.depth : t->d.target == 8 ? 6 : t->d.target == 3 ? t->d.height : 1;   // a cube array's depth counts layer-faces (tex_desc)
     // Taken after the stamp and the protect: a write that lands from here on faults and is found at the next look
@@ -5865,7 +6092,7 @@ static void *tex_mtl_resolve(const tex_t *ct, int *in_storage, id<MTLTexture> __
         mt = pair_texture(t, d);   // (neither filled: their storage is shared)
         if (!mt) mt = image_texture(t, d);
         if (!mt) { mt = rh_texture(t, d); if (!mt) mt = [g_dev newTextureWithDescriptor:d];
-            if (mt) { res_add(mt); if (!bcp_up_fill(t, mt) && !tex_init_fill(t, mt)) tex_zero_fill(mt); } }   // a side of a compressed-alias pair takes the other side's bytes (bcp_up_fill)
+            if (mt) { res_add(mt); bcd_tag(mt, t->d.format); if (!bcp_up_fill(t, mt) && !tex_init_fill(t, mt)) tex_zero_fill(mt); } }   // a side of a compressed-alias pair takes the other side's bytes (bcp_up_fill)
         if (!mt) { RED_ONCE(2, "failed to create MTLTexture %ux%u format %#x target %d", t->d.width, t->d.height, t->d.format, t->d.target); return NULL; }
     }
     if (mt.allocatedSize >= (256u << 20)) { static int nb; if (nb++ < 20)   // the textures that take most of the GPU's memory (a GPU out-of-memory error says nothing of which)
@@ -6550,6 +6777,9 @@ void pg_commit_ext(id<MTLCommandBuffer> cb) { pg_commit(cb); }
 static int mtl_fmt_block(MTLPixelFormat f) { return (f >= MTLPixelFormatBC1_RGBA && f <= MTLPixelFormatBC7_RGBAUnorm_sRGB) || (f >= MTLPixelFormatPVRTC_RGB_2BPP && f < MTLPixelFormatGBGR422); }
 static int nvn_fmt_bc(uint32_t f) { return f >= 0x41 && f <= 0x50; }   // NVN BC1–7 / BC6H formats (0x41 RGB_DXT1 … 0x50 BC6H unsigned)
 static int bc_block_bytes(MTLPixelFormat f) {   // bytes per 4x4 block of a BC format, 0 for other formats
+    // the EAC formats recoded BC textures are made as (DM_BC_RECODE, nvn_fmt_mtl.c): to the game they are BC4 / BC5 textures, so their blocks go the BC ways (shadows, alias copies)
+    if (f == MTLPixelFormatEAC_R11Unorm || f == MTLPixelFormatETC2_RGB8 || f == MTLPixelFormatETC2_RGB8_sRGB) return 8;
+    if (f == MTLPixelFormatEAC_RG11Snorm || f == MTLPixelFormatEAC_RG11Unorm || f == MTLPixelFormatASTC_4x4_HDR) return 16;
     if (f < MTLPixelFormatBC1_RGBA || f > MTLPixelFormatBC7_RGBAUnorm_sRGB) return 0;
     return f <= MTLPixelFormatBC1_RGBA_sRGB || f == MTLPixelFormatBC4_RUnorm || f == MTLPixelFormatBC4_RSnorm ? 8 : 16;
 }
@@ -8278,6 +8508,7 @@ static void *tex_by_id_ref(int tid) {
         if (!r.has_v) memset(&r.v, 0, sizeof r.v);
         uint32_t pf = view_pf ? view_pf : (uint32_t)base.pixelFormat;
         if (stv) pf = MTLPixelFormatX32_Stencil8;
+        pf = (uint32_t)view_pf_held(base.pixelFormat, (MTLPixelFormat)pf);   // a recoded texture or a stand-in viewed in the game's BC format
         if (r.v.set_format && nvn_fmt_bc(rp->t.d.format) && !nvn_fmt_bc(r.v.format)) {   // the raw blocks of a BC texture through an uncompressed view (see rt_view_fmt): Metal has no such view
             RED_ONCE(86, "Metal cannot create the raw-block view of a compressed texture (NVN format %#x → view %#x): treated as an empty slot", rp->t.d.format, r.v.format);
             return NULL;
@@ -19199,6 +19430,7 @@ void mtl_exec(const uint8_t *p) {
 static id<MTLRenderPipelineState> g_blit_pso; static MTLPixelFormat g_blit_fmt;
 static id<MTLSamplerState> g_blit_samp;
 static uint64_t g_present_n;
+static uint64_t g_present_ser;   // the serial of the texture present_now last showed (tests: which of a present's pictures the display link showed)
 uint64_t mtl_present_count(void) { return g_present_n; }   // Actual present count (heat attribution DM_HEAT computes the present frame rate)
 void mtl_res_snapshot(mtl_res_count *out) {
     memset(out, 0, sizeof *out);
@@ -19646,7 +19878,14 @@ static void present_shape(id<MTLTexture> src, const int crop[4], double *w, doub
     v = atomic_load(&g_layer_shape);
     *w = v ? (double)(uint32_t)v : 1920; *h = v ? (double)(v >> 32) : 1080;
 }
-static MTLViewport present_fit(id<MTLTexture> src, const int crop[4], double dw, double dh) { double w, h; present_shape(src, crop, &w, &h); return present_viewport(w, h, dw, dh); }
+// Stretch (the iOS front end with Ultrawide, front_ios.m): the picture covers the whole canvas, its shape changed. For a game whose code mod widens its 3D view to the screen's shape
+// inside its 16:9 picture (ACNH's ultrawide mod, as emulators' "stretch to window" shows it); without such a mod the picture would only look wider
+static _Atomic int g_present_stretch;
+void mtl_present_stretch(int on) { atomic_store(&g_present_stretch, on); }
+static MTLViewport present_fit(id<MTLTexture> src, const int crop[4], double dw, double dh) {
+    if (atomic_load_explicit(&g_present_stretch, memory_order_relaxed)) return (MTLViewport){0, 0, dw, dh, 0, 1};
+    double w, h; present_shape(src, crop, &w, &h); return present_viewport(w, h, dw, dh);
+}
 // The valid source rectangle of a present (x, y, width, height; the crop of nvnWindowSetCrop, zero = the whole texture); 0 when it lies outside the texture
 static int present_crop_rect(id<MTLTexture> src, const int crop[4], NSUInteger r[4]) {
     r[0] = 0; r[1] = 0; r[2] = src.width; r[3] = src.height;
@@ -19698,12 +19937,15 @@ typedef struct { id<MTL4FXSpatialScaler> sc; id<MTLTexture> in, out; uint64_t ma
 static fx_state g_fx_present;   // only the present thread encodes or replaces the scaler
 static id<MTL4Compiler> g_fx_comp;
 static int g_fx_mode = -1;   // 1 = metalfx, 0 = off
+static int fg_on(void); static double fg_size(void); static double fg_fixed(void);
 static int fx_mode(void) {
     if (g_fx_mode >= 0) return g_fx_mode;
     const char *e = getenv("DM_PRESENT_UPSCALE"); int v = 0;
     if (e && (!strcmp(e, "metalfx") || !strcmp(e, "1"))) v = 1;
     else if (e && (!strcmp(e, "off") || !strcmp(e, "0"))) v = 0;
     else if (e && *e) MLOG("[RED] DM_PRESENT_UPSCALE=%s: metalfx or off; keeping %s", e, v ? "metalfx" : "off");
+    // Only for a fixed DM_FRAMEGEN_SCALE below 1 (frame generation's frames made smaller than shown); the pixel budget's frames go back through the bilinear pass, which is far cheaper
+    if (!v && fg_on() && fg_fixed() && fg_fixed() < 1) { v = 1; MLOG("present upscaling: metalfx, as frame generation makes its frames smaller than shown (DM_FRAMEGEN_SCALE)"); }
     if (v && !(g_q4 && [MTLFXSpatialScalerDescriptor supportsMetal4FX:g_dev])) { MLOG("present upscaling: this GPU has no Metal 4 MetalFX spatial scaler; the present scales bilinearly"); v = 0; }
     MLOG("present upscaling (DM_PRESENT_UPSCALE): %s", v ? "metalfx, MetalFX's spatial scaler where the picture is shown larger than the game renders it" : "off, bilinear");
     return g_fx_mode = v;
@@ -20076,6 +20318,9 @@ static void present_shot(id<MTLTexture> src, const char *path, const int crop[4]
     }
     if (*ready) shot(src, path, 1, crop);
 }
+static int fg_on(void); static double fg_fixed(void);
+static uint64_t g_fg_shown;   // frame generation: pictures shown after their generated frames (see g_fg_owe)
+static int g_fg_owing;   // frame generation: present_now is showing a present's own picture after its generated frame (display link thread only)
 static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t ticket, const int crop[4], uint64_t ev_val, id<CAMetalDrawable> supplied, double target_ts) {
     if (g_present_stall_ns) { struct timespec ts = {0, (long)g_present_stall_ns}; nanosleep(&ts, NULL); }
     g_present_n++;
@@ -20088,6 +20333,7 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
              g_up_total_ns / 1e6, g_bp_first_present / 1e9);
     }
     PD("X ser=%llu", t->serial);
+    g_present_ser = t->serial;
     id<MTLTexture> src = tex_mtl(t);
     if (!src) { RED_ONCE(8, "present texture could not get an MTLTexture"); return 0; }
     // The picture's shape for the front end's layout (front.h front_picture_shape): reported when its width / height changes by more than 0.1 %, not on a size change of the same
@@ -20098,7 +20344,9 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
     // outside the committed set when the display command buffer sampled it. Super Smash Bros. Ultimate presents its window texture in its first frames before drawing into it:
     // the display queue page-faulted (kIOGPUCommandBufferCallbackErrorPageFault) and macOS then ignored every later command buffer of the process, so the window stayed pink
     // (headless runs never present, and every game before drew into a window texture before presenting it). A commit with nothing new costs nothing
-    res_commit();
+    // Not for the host's own present snapshots and generated frames (serials 2^61 + n, in their own residency set, committed when made): the commit takes g_res_mu, which the
+    // submitting thread holds while it commits a frame's work, and on the display link thread that wait was a hitch on screen (kid-with-sword-remake X10b on an iPhone)
+    if ((t->serial >> 61) != 1) res_commit();
     // DM_NVN_REGLUM=x0,y0,x1,y1:file (normalized coordinates): read back this region on every present and record "present sequence number, present time ns, region mean luminance, subsampled grayscale thumbnail (hex)" (diagnostic: verify that animation speed is independent of frame rate).
     // A separate command buffer is queued after this frame's rendering (the same queue executes in submit order); does not wait for the GPU and does not disturb frame pacing
     static int rl = -1; static float rr[4]; static FILE *rlf; static pthread_mutex_t rlmu = PTHREAD_MUTEX_INITIALIZER;
@@ -20147,7 +20395,15 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
     id<CAMetalDrawable> dr = supplied ? supplied : [layer nextDrawable];
     if (!supplied) g_drawable_ns += now_ns() - dt0;
     if (!dr) return 0;
-    int alloc_i = (int)(ticket % 3);
+    int alloc_i = g_fg_owing ? 3 + (int)(g_fg_shown % 3) : (int)(ticket % 3);
+    if (!g_present_alloc4[alloc_i]) {   // frame generation's own three, at its first picture after a generated frame (the picture it owes shares its present's ticket)
+        NSError *ae = nil; MTL4CommandAllocatorDescriptor *pad = [MTL4CommandAllocatorDescriptor new];
+        pad.label = [NSString stringWithFormat:@"nvn-mtl present allocator %d (frame generation)", alloc_i];
+        g_present_alloc4[alloc_i] = [g_dev newCommandAllocatorWithDescriptor:pad error:&ae]; g_present_cb[alloc_i] = [g_dev newCommandBuffer];
+        g_present_uv[alloc_i] = [g_dev newBufferWithLength:sizeof(float) * 8 options:MTLResourceStorageModeShared];
+        if (!g_present_alloc4[alloc_i] || !g_present_cb[alloc_i] || !g_present_uv[alloc_i]) MDIE("failed to create present allocator %d: %s", alloc_i, ae.localizedDescription.UTF8String);
+        res_add(g_present_uv[alloc_i]); res_commit();
+    }
     if (g_present_alloc_fence[alloc_i]) {
         pthread_mutex_lock(&g_pq_mu);
         while (g_present_alloc_done[alloc_i] < g_present_alloc_fence[alloc_i]) pthread_cond_wait(&g_pq_cv, &g_pq_mu);
@@ -20174,7 +20430,7 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
     id<MTL4CommandBuffer> buffers[] = {cb};
     pthread_mutex_lock(&g_pq_mu); g_pq_inflight++; pthread_mutex_unlock(&g_pq_mu);
     [g_q4 commit:buffers count:1 options:o];
-    if (target_ts > 0) {
+    if (target_ts > 0 && !g_fg_owing) {   // (the picture a generated frame went before: its present was sampled with that frame)
         static double leads[300], e2e[300];   // e2e: game enqueue -> system-scheduled present (including the time waiting in the queue for the display-link callback), the full span of input latency that our side can read
         static uint64_t lead_n;
         leads[lead_n % 300] = (target_ts - CACurrentMediaTime()) * 1000.0; e2e[lead_n % 300] = g_link_it_tin > 0 ? (target_ts - g_link_it_tin) * 1000.0 : 0;
@@ -20195,7 +20451,7 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
     (void)period; [dr present];
 #else
     uint64_t pn = ticket;   // Record the present time by the game's present sequence number (ticket number): hle's present statistics are taken by "the game's nth present"; in the display link path the actual present count != the game's present count (old frames get merged and dropped)
-    [dr addPresentedHandler:^(id<MTLDrawable> d) {   // Actual presentation time (the time this frame is really put on screen, CACurrentMediaTime base)
+    if (!g_fg_owing) [dr addPresentedHandler:^(id<MTLDrawable> d) {   // Actual presentation time (the time this frame is really put on screen, CACurrentMediaTime base; for a present with a generated frame, that frame's)
         CFTimeInterval tt = d.presentedTime;
         nvn_present_history_put(&g_present_history, pn, tt > 0 ? tt : -1);
         pres_seen(pn, tt);
@@ -20214,13 +20470,37 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
 // Swapchain texture return: before AcquireTexture gets a texture it waits for the ticket of that texture's previous present to be processed (mtl_present_wait), after which the commands the game draws into it
 // are necessarily ordered after that blit on the GPU queue.
 #define PQ 8
-typedef struct { tex_t t; double period; uint64_t frame; int crop[4]; double t_in; uint64_t ev_val, snap_v, sub_v; } pq_item;   // snap_v: the snapshot copy this present shows (snap_commit_wait); sub_v: the submissions a present of the game's own texture follows (sub_commit_wait)   // t_in: the time the game handed this frame into the present queue (CACurrentMediaTime); ev_val: see g_ext_ev
+typedef struct { tex_t t; double period; uint64_t frame; int crop[4]; double t_in; uint64_t ev_val, snap_v, sub_v, gen; } pq_item;   // gen: the serial of the frame generated before it (frame generation), 0 = none;   // snap_v: the snapshot copy this present shows (snap_commit_wait); sub_v: the submissions a present of the game's own texture follows (sub_commit_wait)   // t_in: the time the game handed this frame into the present queue (CACurrentMediaTime); ev_val: see g_ext_ev
 // External producer (the Vulkan layer, dm/gfx/vk) renders on its own queue and signals this event when a frame's rendering is done: the present of that frame waits for the value on g_q4
 static void ext_wait(uint64_t v) { if (v && g_ext_ev) [g_q4 waitForEvent:g_ext_ev value:v]; }
 static void snap_commit_wait(uint64_t v);
 static pq_item g_pq[PQ];
 static uint64_t g_pq_in;
 static double g_link_vperiod, g_link_vhalf;   // virtual ticks (link_range): seconds per counted tick (0 = every callback is a tick) and half a refresh of the screen
+// Frame generation on the display link (DM_FRAMEGEN, see fg_on): a present whose generated frame was shown owes its own picture half its present interval later (g_fg_owe_at).
+// Under g_pq_mu; g_fg_owing (display link thread only) marks that present for present_now. g_fg_tick: the interval between counted ticks (a running mean)
+static pq_item g_fg_owe; static uint64_t g_fg_owe_tk; static double g_fg_owe_at, g_fg_tick; static int g_fg_owed;
+static uint64_t g_fg_late;
+// Frame generation never falls back to the game's 30 fps (the owner: 60 stable, no switching to 30). X6-FF2 paused the generated frames while frames dropped and then stopped
+// the interpolation for 30-60 presents; each stop showed as the picture switching from 60 to 30 and back: 8 stops in 90 s in FF2's log 17 (thermal 1 to 2, the game 11-24 ms
+// and the interpolation 5-10 ms at 1920x1080 a frame), 11 in two minutes in log 15. Now a present that came late (a tick found its interval over and nothing new to show:
+// g_fg_starved) still shows its generated frame first: the frame between the picture held on screen and the new one, so the late frame reads as a slower step, not a jump.
+// Only a present taken over older ones dropped for it shows its own picture alone, that present only (g_fg_paused_behind): the screen is behind and catches up.
+// All on the display link thread, under g_pq_mu. Judged by the link's ticks, not by the time between presents, which a game's own pacing varies
+#define FG_AGAIN 30
+static int g_fg_starved; static uint64_t g_fg_paused_behind, g_fg_last_drop, g_fg_drops;
+// Frames dropping on and on (a second drop within FG_AGAIN presents of the one before) make the interpolation lighter instead: the pixel budget's next step (fg_level_down,
+// g_fg_budget), smaller generated and shown frames brought back to the screen's size by the present's bilinear pass; past the last step it stays there and keeps running.
+// Its cost follows its pixels, so 960x540 costs about a quarter of 1920x1080, and the GPU's lighter load is less heat. A step back up after FG_UP_CALM presents in a row in
+// time (a minute at 30 fps), twice that, up to FG_UP_CALM_MAX, when the step up was followed by another step down within FG_UP_BACK presents. Decided by dropped frames,
+// not by the temperature
+enum { FG_LEVELS = 3, FG_UP_CALM = 1800, FG_UP_CALM_MAX = 7200, FG_UP_BACK = 600 };
+static const double g_fg_budget[FG_LEVELS] = {1440.0 * 810, 1200.0 * 675, 960.0 * 540};
+static const char *const g_fg_budget_name[FG_LEVELS] = {"1440x810", "1200x675", "960x540"};
+static _Atomic int g_fg_level;   // the budget's step: changed on the display link thread under g_pq_mu, read where the snapshots are sized (fg_shown_size)
+static _Atomic uint64_t g_fg_shown_px;   // the pixels of the last picture sized for frame generation as shown (fg_shown_size), for fg_level_down
+static uint64_t g_fg_lvl_calm, g_fg_up_at, g_fg_lvl_downs, g_fg_lvl_ups; static int g_fg_up_need = FG_UP_CALM;
+static int fg_level_down(void); static _Atomic uint64_t g_fg_gpu_avg_us;
 
 @interface NvMetalDisplayLinkDelegate : NSObject <CAMetalDisplayLinkDelegate>
 @end
@@ -20297,6 +20577,8 @@ static struct timespec link_deadline(uint64_t ns);
         tick_time = next;   // the hold follows counted slots even when their physical refreshes are unevenly spaced
         next += vp;
     }
+    { static double t_prev; double dt = tick_time - t_prev; t_prev = tick_time;   // frame generation: the interval of counted ticks (a running mean)
+      if (dt > 0.004 && dt < 0.1) g_fg_tick = g_fg_tick > 0 ? g_fg_tick * 0.9 + dt * 0.1 : dt; }
     const int rate = mtl_link_rate();
     const double tick_period = vp > 0 ? vp : 1.0 / rate;
     static double cb_prev, gap_max; static int nticks;   // for link history: callbacks counted as ticks since the previous present, and the longest interval between them
@@ -20311,7 +20593,28 @@ static struct timespec link_deadline(uint64_t ns);
     pthread_mutex_unlock(&g_link_mu);
     pthread_mutex_lock(&g_pq_mu);
     // Checked again: the queue lock was released to publish the tick, and rescue or a mode change can take the queue away from this callback in that interval.
-    if (!g_dm_present_link || g_rescue_mode) { pthread_mutex_unlock(&g_pq_mu); return; }
+    if (!g_dm_present_link || g_rescue_mode) { g_fg_owed = 0; pthread_mutex_unlock(&g_pq_mu); return; }
+    // Frame generation (DM_FRAMEGEN): the present whose generated frame is on screen now shows its own picture, from half its present interval on. Not once its interval is over
+    // and the next present waits: that one is newer
+    if (g_fg_owed && tick_time >= g_fg_owe_at - 0.002) {
+        int newer = tick_time >= g_link_hold_until - 0.002 && g_pq_read != g_pq_in;
+        g_fg_owed = 0;
+        if (!newer && !atomic_load(&g_present_suspended)) {
+            pq_item ow = g_fg_owe; uint64_t tk = g_fg_owe_tk;
+            if (!(++g_fg_shown % 1800)) MLOG("frame generation on the display link: %llu generated frames shown, each followed by its present's own picture; %llu of those skipped for a newer present; "
+                                             "presents dropped or late %llu, %llu of them shown without theirs (taken over dropped ones); made lighter %llu times and back %llu times, now the %s pixel budget",
+                                             (unsigned long long)g_fg_shown, (unsigned long long)g_fg_late, (unsigned long long)g_fg_drops, (unsigned long long)g_fg_paused_behind,
+                                             (unsigned long long)g_fg_lvl_downs, (unsigned long long)g_fg_lvl_ups, fg_fixed() ? "DM_FRAMEGEN_SCALE's" : g_fg_budget_name[atomic_load(&g_fg_level)]);
+            atomic_fetch_add(&g_link_presenting, 1);
+            pthread_mutex_unlock(&g_pq_mu);
+            g_fg_owing = 1;
+            @autoreleasepool { present_now(&ow.t, 0, ow.frame, tk, ow.crop, 0, update.drawable, update.targetPresentationTimestamp); }
+            g_fg_owing = 0;
+            atomic_fetch_sub(&g_link_presenting, 1);
+            return;
+        }
+        g_fg_late++;
+    }
     // Keep a multi-tick frame on screen until its hold ends, even if the next frame is already queued.
     const int hold = g_link_hold_until > 0 && tick_time < g_link_hold_until - 0.002;
     // The late latch (nvn_link_latch.h): wait briefly for the woken acquire's present (g_pq_mu is released while waiting, so present_enqueue can queue it; a present that
@@ -20340,7 +20643,7 @@ static struct timespec link_deadline(uint64_t ns);
             if (g_pq_in > in0) { g_link_latched++; g_link_latch_misses = 0; } else { g_link_latch_out++; g_link_latch_misses++; }
         }
     }
-    if (g_pq_read == g_pq_in || atomic_load(&g_present_suspended)) { g_link_empty++; pthread_mutex_unlock(&g_pq_mu); return; }
+    if (g_pq_read == g_pq_in || atomic_load(&g_present_suspended)) { g_link_empty++; if (!hold) g_fg_starved = 1; pthread_mutex_unlock(&g_pq_mu); return; }   // (FG_AGAIN): an empty tick that holds no frame is a late one
     if (hold) { g_link_held++; pthread_mutex_unlock(&g_pq_mu); return; }
     uint64_t first = g_pq_read + 1, ticket = g_pq_in;
     // In order, one frame per tick and at most one behind the newest: two waiting, the older now and the newer on the next tick; three or more, the older ones are dropped. Taking the newest
@@ -20349,6 +20652,27 @@ static struct timespec link_deadline(uint64_t ns);
     static int fifo = -1; if (fifo < 0) { const char *e = getenv("DM_PRESENT_FIFO"); fifo = !(e && !strcmp(e, "0")); MLOG("display link: %s", fifo ? "frames in order, at most one behind" : "the newest frame each tick (DM_PRESENT_FIFO=0)"); }
     if (fifo && ticket > first) ticket = ticket - first >= 2 ? g_pq_in - 1 : first;
     pq_item it = g_pq[(ticket - 1) % PQ]; g_link_it_tin = it.t_in;
+    {   // frame generation while frames drop (FG_AGAIN): it never stops; frames dropping on and on make it lighter
+        // Behind: older presents were dropped for this one. One newer present waiting is not: with snapshots the game runs a frame ahead of the screen, and taking that
+        // as behind paused frame generation for 1,060 of about 2,900 presents of a run that dropped next to no frames (log 80)
+        int behind = ticket > first, late = g_fg_starved, drop = behind || late; g_fg_starved = 0;
+        if (drop) { int again = g_fg_last_drop && ticket - g_fg_last_drop <= FG_AGAIN; g_fg_last_drop = ticket; g_fg_lvl_calm = 0; g_fg_drops++;
+            if (again && fg_on()) {
+                int st = fg_level_down();
+                if (st < 0) { static uint64_t n; if (!(n++ % 100)) MLOG("frame generation: frames keep dropping, but the interpolation takes only %.1f ms: the game's frames are late, not its; its frames keep the %s pixel budget (%llu drops so far)",
+                                                                     atomic_load(&g_fg_gpu_avg_us) / 1000.0, g_fg_budget_name[atomic_load(&g_fg_level)], (unsigned long long)g_fg_drops); }
+                else if (st > 0) {   // lighter (FG_LEVELS)
+                    if (g_fg_up_at && ticket - g_fg_up_at <= FG_UP_BACK) g_fg_up_need = MIN(g_fg_up_need * 2, FG_UP_CALM_MAX);
+                    g_fg_lvl_downs++; g_fg_last_drop = 0;   // the next drop counts as a lone one: the lighter frames get their chance
+                    MLOG("frame generation: frames keep dropping, its frames are made lighter: the %s pixel budget (step %d of %d; #%llu)", g_fg_budget_name[atomic_load(&g_fg_level)],
+                         atomic_load(&g_fg_level) + 1, FG_LEVELS, (unsigned long long)g_fg_lvl_downs);
+                } else { static uint64_t n; if (!(n++ % 100)) MLOG("frame generation: frames keep dropping at its lightest frames (the %s pixel budget); it keeps running, never falling back to 30 fps (%llu drops so far)",
+                                                                   fg_fixed() ? "DM_FRAMEGEN_SCALE's" : g_fg_budget_name[atomic_load(&g_fg_level)], (unsigned long long)g_fg_drops); } } }
+        if (!drop && atomic_load(&g_fg_level) > 0 && ++g_fg_lvl_calm >= (uint64_t)g_fg_up_need) {   // in time for long enough: a step back up
+            atomic_store(&g_fg_level, atomic_load(&g_fg_level) - 1); g_fg_lvl_calm = 0; g_fg_up_at = ticket; g_fg_lvl_ups++;
+            MLOG("frame generation: %d presents in a row in time, its frames back to the %s pixel budget (step %d of %d)", g_fg_up_need, g_fg_budget_name[atomic_load(&g_fg_level)], atomic_load(&g_fg_level) + 1, FG_LEVELS); }
+        if (it.gen && behind) { it.gen = 0; g_fg_paused_behind++; }   // the screen is behind: this present alone, its own picture
+    }
     g_pq_read = ticket;
     atomic_fetch_add(&g_link_presenting, 1);
     if (ticket > first) { g_link_dropped += ticket - first; for (uint64_t k = first; k < ticket; k++) { nvn_present_history_put(&g_present_history, k, -1); mtl_tex_unpin(g_pq[(k-1)%PQ].t.serial); } }   // Old frames merged and dropped are recorded as "not presented", so the present statistics honestly count them as dropped frames
@@ -20369,11 +20693,15 @@ static struct timespec link_deadline(uint64_t ns);
     }
     int submitted;
     ext_wait(it.ev_val); snap_commit_wait(it.snap_v); sub_commit_wait(it.sub_v);
+    // Frame generation: the frame generated before this present first, for a present held 1.5 ticks or more (two at 30 fps on a 60 Hz link), its own picture after it (g_fg_owe)
+    tex_t gt; int gen = it.gen && g_fg_tick > 0 && it.period >= 1.5 * g_fg_tick;
+    if (gen) { memset(&gt, 0, sizeof gt); gt.magic = MAGIC('T', 'E', 'X', 0); gt.serial = it.gen; }
     @autoreleasepool {
-        submitted = !atomic_load(&g_present_suspended) && present_now(&it.t, it.period, it.frame, ticket, it.crop, it.ev_val, update.drawable, update.targetPresentationTimestamp);
+        submitted = !atomic_load(&g_present_suspended) && present_now(gen ? &gt : &it.t, it.period, it.frame, ticket, it.crop, it.ev_val, update.drawable, update.targetPresentationTimestamp);
         mtl_tex_unpin(it.t.serial);
     }
     g_link_hold_until = submitted && hold_ticks >= 2 ? tick_time + hold_ticks * tick_period : 0;
+    if (submitted && gen) { pthread_mutex_lock(&g_pq_mu); g_fg_owe = it; g_fg_owe_tk = ticket; g_fg_owe_at = tick_time + it.period / 2; g_fg_owed = 1; pthread_mutex_unlock(&g_pq_mu); }
     atomic_fetch_sub(&g_link_presenting, 1);
     if (!submitted || atomic_load(&g_present_suspended)) {
         pthread_mutex_lock(&g_pq_mu);
@@ -20486,8 +20814,13 @@ static void link_sync(void) {   // Called every frame by the game's present thre
     if (g_rescue_mode) want = 0;
     if (!want) { g_link_probe_pending = 0; g_link_probe_at = 0; }
     pthread_mutex_unlock(&g_pq_mu);
-    if (!g_present_link_env && want && mtl_fps_target() == 30 && link_30hz()) want = 3;   // 30 Hz power-saving mode when the link rate is automatic
+    if (!g_present_link_env && want && mtl_fps_target() == 30 && link_30hz() && !fg_on()) want = 3;   // 30 Hz power-saving mode when the link rate is automatic (not with frame generation, which shows a frame on every 60 Hz tick)
     if (!g_present_link_env && want && mtl_fps_target() == 40) want = 2;   // 40 fps needs the 120 Hz link (3 ticks = 25 ms) when the link rate is automatic
+    // Frame generation at 60 fps: the 120 Hz link, each present held two ticks, its generated frame on the first (fg_owe): 120 frames a second on a 120 Hz screen
+    if (!g_present_link_env && want == 1 && mtl_fps_target() == 60 && fg_on() && front_screen_max_fps() >= 120) {
+        static int said; if (!said++) MLOG("frame generation at 60 fps: the display link at 120 Hz, a generated frame between each two presents");
+        want = 2;
+    }
     if (want) front_screen_match(want == 3 ? 30 : want == 2 ? 120 : 60);   // the game's rate: a variable-refresh screen goes to a fixed-rate mode at a multiple where it has one
     static int vrr_was; int vrr = want == 1 && link_vrr_120();   // variable-refresh fullscreen that kept its mode: the 120 Hz link paces the 60 (link_vrr_120)
     if (vrr != vrr_was) { vrr_was = vrr; MLOG("display link: %s (frame %llu)", vrr ? "120 Hz in fullscreen on a variable-refresh screen, a frame every other tick (DM_PRESENT_LINK=1 keeps 60 Hz)" : "60 Hz again (window, fixed-rate screen or another frame rate)", (unsigned long long)atomic_load(&g_cur_frame)); }
@@ -20650,18 +20983,361 @@ uint64_t mtl_present_ext(uint64_t serial, double period, void *ev, uint64_t ev_v
 // The ring's length is the number of frames the game may run ahead of the screen: DM_PRESENT_SNAP=<n> (2 to SNAP_MAX; 1 = 2). Off by default; the iOS launcher's Frame buffering toggle enables it.
 #define SNAP_MAX 4
 // old: the slot's texture before the presented size or format last changed, resident until the slot's next use (snap_take)
-static struct { id<MTLTexture> tex, old; uint64_t serial; _Atomic uint64_t ticket, ev; } g_snap[SNAP_MAX];
+// gen / gen_old / gen_serial: the frame generated between the slot's present and the one before (frame generation, below), gen_ok when it holds one; seq: the slot's present
+// in the order of all presents (fg_seq), for whether two slots hold consecutive presents
+static struct { id<MTLTexture> tex, old, gen, gen_old, lum, lum_old; uint64_t serial, gen_serial, seq; int gen_ok; _Atomic uint64_t ticket, ev; } g_snap[SNAP_MAX];   // lum: frame generation's 1/8 luma of tex (fg_luma)
 static id<MTL4CommandAllocator> g_snap_alloc[SNAP_MAX]; static id<MTL4CommandBuffer> g_snap_cb[SNAP_MAX];
 static id<MTLSharedEvent> g_snap_ev; static uint64_t g_snap_v;
 static _Atomic uint64_t g_snap_next, g_snap_cmt;   // g_snap_cmt: the last copy the encode thread has committed (its g_snap_v)
 static int g_snap_n = 2;
+// ---------- Frame generation (DM_FRAMEGEN) ----------
+// A game held at 30 fps on a 60 Hz display link shows each frame for two ticks. With DM_FRAMEGEN=1 (the launcher's Frame generation, offered with the 30 fps frame rate) the
+// second tick shows a frame of its own: MetalFX's frame interpolator makes, from each present and the one before, the picture halfway between them, the display link shows it
+// on the tick that would have shown the new frame, and the new frame half a present interval later (fg_owe). The game does the work of 30 frames a second and the screen
+// shows 60, for a frame's interpolation on the GPU each (about 4 ms at 1920x1080 on an M5) and half a present interval (16.7 ms) more from the game's present to the screen.
+// Generation works on the presented picture alone, so it holds for every game and needs nothing from its profile. X6-X9 gave the interpolator no motion (a constant
+// motion texture) and left motion to its own flow, which a probe (a detailed picture panned between two frames, 1176x540 on an M5) found exact up to about 64 px a frame,
+// torn by 96-128 px and gone past 192 px, where the generated frame stayed on one of the two: on the phone's 2352x1080 a fast camera turn passes that, and the camera
+// juddered (log 81, X9). Since X10 the motion comes from the two pictures themselves (fg_motion, dm/gfx/msl/fgmv.metal: each 64x64 px tile searched within +-192 px at 1/8
+// size, then each 8 px block given its tile's, a neighbour's or no motion, whichever matches best around it): at 2352x1080 the background's error against the ideal
+// halfway frame went from 0.070-0.090 to 0.0075-0.0085 at 160-192 px a frame (0.0091 to 0.0028 at 64). With motion anywhere MetalFX moves a still HUD beside it as well,
+// even with the HUD's own vectors at zero, so still detailed pixels and those near them are taken from the present itself after the interpolation (fg_keep): the HUD's
+// error stayed at 0.002-0.0075 (0.0015 with no motion at all; 0.01-0.065 without the keep). DM_FRAMEGEN_MV=0 gives the interpolator no motion as X6-X9 did. It runs on the present snapshots (above), which it turns on with a ring of at least 3: each present's copy
+// on the game's queue is followed in the same command buffer by the interpolation from the previous slot's copy into the slot's gen texture, and a slot is reused only once
+// the present after its own has been processed (present_enqueue), since its picture is shown again on the tick after its generated one. A present that does not follow the
+// one before (a snapshot skipped, a new size) starts the interpolator's history again, and its generated frames are shown only from the third one on, the first ones it
+// makes being the new frame unchanged. Only on the display link, where frames are held for their present interval: with the present thread (DM_PRESENT_LINK=0, the rescue
+// mode) and for present intervals under 1.5 ticks the generated frames are not shown
+static int g_fg_mode = -1;
+static int fg_on(void) {
+    if (g_fg_mode >= 0) return g_fg_mode;
+    const char *e = getenv("DM_FRAMEGEN"); int v = e && atoi(e) > 0;
+    int sup = g_q4 && [MTLFXFrameInterpolatorDescriptor supportsMetal4FX:g_dev];
+    // Kept for the iOS launcher's Frame Generation row at the next start (Launcher.swift deviceSetup): the launcher can't ask the GPU itself, as a Metal device made
+    // there comes before the Performance HUD's MTL_HUD_ENABLED and the HUD stays off (FF11; GitHub issue #840)
+    [[NSUserDefaults standardUserDefaults] setBool:!sup forKey:@"dm.framegen.unsupported"];
+    if (v && !sup) { MLOG("[RED] frame generation (DM_FRAMEGEN): this GPU has no Metal 4 MetalFX frame interpolator; frames are shown as the game draws them"); v = 0; }
+    else if (v) MLOG("frame generation (DM_FRAMEGEN=1): MetalFX's frame interpolator makes a frame between each two presents, shown on the display link between them");
+    return g_fg_mode = v;
+}
+// DM_FRAMEGEN_MV (default 1): frame generation's motion from the presented pictures (fg_motion) and the still HUD kept (fg_keep); 0: no motion, as X6-X9
+static id<MTLComputePipelineState> g_fgmv_ps[8]; static id<MTL4ArgumentTable> g_fgmv_args; static int g_fgmv_ok = -1;
+enum { FGMV_LUMA, FGMV_SEARCH, FGMV_PICK, FGMV_STILL, FGMV_HUD, FGMV_KEEP, FGMV_PSTILL, FGMV_CONF };
+static int fg_mv_on(void) {
+    if (g_fgmv_ok >= 0) return g_fgmv_ok;
+    const char *e = getenv("DM_FRAMEGEN_MV");
+    if (e && atoi(e) <= 0) { MLOG("frame generation: no motion given to the interpolator (DM_FRAMEGEN_MV=0): its own flow finds it, up to about 64 px a frame"); return g_fgmv_ok = 0; }
+    NSError *err = nil; id<MTLLibrary> lib = host_lib("fgmv", &err);
+    static const char *fn[8] = {"fgmv_luma", "fgmv_search", "fgmv_pick", "fgmv_still", "fgmv_hud", "fgmv_keep", "fgmv_pstill", "fgmv_conf"};
+    // DM_FRAMEGEN_PASTE=1: blocks whose motion is not trusted take the present's own pixels whole (fgmv.metal FGMV_PASTE: off by default, squares that stepped at 30 fps on camera turns)
+    const char *pe = getenv("DM_FRAMEGEN_PASTE"); bool paste = pe && atoi(pe) > 0;
+    MTLFunctionConstantValues *cv = [MTLFunctionConstantValues new]; [cv setConstantValue:&paste type:MTLDataTypeBool atIndex:0];
+    for (int i = 0; i < 8; i++) {
+        id<MTLFunction> f = !lib ? nil : i == FGMV_HUD ? [lib newFunctionWithName:@(fn[i]) constantValues:cv error:&err] : [lib newFunctionWithName:@(fn[i])];
+        g_fgmv_ps[i] = f ? [g_dev newComputePipelineStateWithFunction:f error:&err] : nil;
+        if (!g_fgmv_ps[i]) { MLOG("[RED] frame generation: no %s pipeline (%s): the interpolator gets no motion, as X6-X9", fn[i], err.description.UTF8String); return g_fgmv_ok = 0; }
+    }
+    if (g_fgmv_ps[FGMV_SEARCH].maxTotalThreadsPerThreadgroup < 256) { MLOG("[RED] frame generation: the motion search needs 256 threads a group, this GPU gives %lu: no motion given", (unsigned long)g_fgmv_ps[FGMV_SEARCH].maxTotalThreadsPerThreadgroup); return g_fgmv_ok = 0; }
+    MTL4ArgumentTableDescriptor *ad = [MTL4ArgumentTableDescriptor new]; ad.maxTextureBindCount = 5;   // fgmv_keep reads the motion at 4
+    g_fgmv_args = [g_dev newArgumentTableWithDescriptor:ad error:&err];
+    if (!g_fgmv_args) { MLOG("[RED] frame generation: no argument table for the motion (%s): no motion given", err.description.UTF8String); return g_fgmv_ok = 0; }
+    MLOG("frame generation: motion found from the presented pictures (DM_FRAMEGEN_MV=1: 64 px tiles searched within 192 px at 1/8 size, refined to 2 px), the still HUD kept from the present%s",
+         paste ? "; blocks whose motion is not trusted pasted from it (DM_FRAMEGEN_PASTE=1)" : "");
+    return g_fgmv_ok = 1;
+}
+// The formats fg_keep may write the generated frame in (shader writes; not the sRGB ones)
+static int fg_keep_fmt(MTLPixelFormat f) {
+    return f == MTLPixelFormatRGBA8Unorm || f == MTLPixelFormatBGRA8Unorm || f == MTLPixelFormatRGBA16Float || f == MTLPixelFormatRGB10A2Unorm || f == MTLPixelFormatRG11B10Float || f == MTLPixelFormatRGBA32Float;
+}
+static void fgmv_bind(id<MTL4ComputeCommandEncoder> ce, int ps, id<MTLTexture> t0, id<MTLTexture> t1, id<MTLTexture> t2, id<MTLTexture> t3) {
+    [ce setComputePipelineState:g_fgmv_ps[ps]];
+    id<MTLTexture> t[4] = {t0, t1, t2, t3}; for (int i = 0; i < 4; i++) if (t[i]) [g_fgmv_args setTexture:t[i].gpuResourceID atIndex:(NSUInteger)i];
+}
+static void fgmv_grid(id<MTL4ComputeCommandEncoder> ce, NSUInteger w, NSUInteger h) { [ce dispatchThreads:MTLSizeMake(w, h, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)]; }
+static void fgmv_step(id<MTL4ComputeCommandEncoder> ce) { [ce barrierAfterEncoderStages:MTLStageDispatch beforeEncoderStages:MTLStageDispatch visibilityOptions:MTL4VisibilityOptionDevice]; }
 int mtl_snap_on(void) {
     static int v = -1; if (v >= 0) return v;
     const char *e = getenv("DM_PRESENT_SNAP");
     int n = e ? atoi(e) : DM_GAME_PRESENT_SNAP ? 2 : 0;   // the profile's present_snap (a ring of 2)
+    if (fg_on() && n < 3) { MLOG("frame generation: present snapshots on with a ring of 3 (DM_PRESENT_SNAP=%d)", n); n = 3; }
     v = n > 0; g_snap_n = n < 2 ? 2 : n > SNAP_MAX ? SNAP_MAX : n;
     if (v) MLOG("present snapshots (DM_PRESENT_SNAP=%d): each present is copied into a ring of %d host textures, so the screen never samples the game's texture", n, g_snap_n);
     return v;
+}
+static id<MTL4FXFrameInterpolator> g_fg_fi; static id<MTL4Compiler> g_fg_comp;
+static id<MTL4CounterHeap> g_fg_heap;   // per ring slot, timestamps before and after its interpolation (fg_encode, read by the snapshot's commit feedback)
+static id<MTLBuffer> g_fg_tsbuf;   // 8 bytes the encoders holding those timestamps copy 4 of: a timestamp in an encoder without work reads 0
+static double g_fg_gpu_last;   // the last interpolation's GPU time in seconds (tests)
+static _Atomic uint64_t g_fg_gpu_avg_us;   // its moving average (1/16 a sample) in µs: whether the interpolation's own cost is heavy enough for dropping frames to make it lighter (fg_level_down)
+static NSUInteger g_fg_key[3]; static int g_fg_bad;   // the interpolator's colour format, width and height; g_fg_bad: MetalFX made none for them
+static id<MTLTexture> g_fg_depth, g_fg_motion; static int g_fg_clear;   // the depth (constant: far) and motion inputs, cleared by the first command buffer after they are made;
+// the motion is fg_motion's from X10 on (at 1/8 size), else constant (none, at half size)
+static id<MTLTexture> g_fg_tiles, g_fg_still, g_fg_keep, g_fg_pmask, g_fg_conf;   // g_fg_conf: fgmv_conf, at the motion's size
+//   // fg_motion's tile vectors; fg_keep's still blocks and the blocks kept (4x4 px each), and its still pixels (fgmv_pstill)
+static uint64_t g_fg_seq;   // presents that could be copied (present_enqueue), for g_snap[].seq
+static int g_fg_warm;   // interpolations since the history last started again
+static uint64_t g_fg_made, g_fg_resets;
+// The interpolator for col's format and size, with its constant inputs (made again when either changes); nil when MetalFX makes none
+static id<MTL4FXFrameInterpolator> fg_for(id<MTLTexture> col) {
+    NSUInteger key[3] = {col.pixelFormat, col.width, col.height};
+    if (!memcmp(key, g_fg_key, sizeof key)) return g_fg_bad ? nil : g_fg_fi;
+    memcpy(g_fg_key, key, sizeof key); g_fg_fi = nil; g_fg_bad = 1;
+    uint64_t t0 = now_ns(); NSError *err = nil;
+    if (!g_fg_comp) g_fg_comp = [g_dev newCompilerWithDescriptor:[MTL4CompilerDescriptor new] error:&err];
+    // The depth and motion inputs at 1/8 of the picture's size, as fg_motion finds the motion (its vectors in those pixels); with no motion at half the size, as X6-X9
+    int mv = fg_mv_on();
+    NSUInteger iw = mv ? MAX((col.width + 7) / 8, 16) : MAX(col.width / 2, 16), ih = mv ? MAX((col.height + 7) / 8, 16) : MAX(col.height / 2, 16);
+    MTLFXFrameInterpolatorDescriptor *d = [MTLFXFrameInterpolatorDescriptor new];
+    d.colorTextureFormat = col.pixelFormat; d.outputTextureFormat = col.pixelFormat;
+    d.depthTextureFormat = MTLPixelFormatDepth32Float; d.motionTextureFormat = MTLPixelFormatRG16Float;
+    d.inputWidth = iw; d.inputHeight = ih; d.outputWidth = col.width; d.outputHeight = col.height;
+    id<MTL4FXFrameInterpolator> fi = g_fg_comp ? [d newFrameInterpolatorWithDevice:g_dev compiler:g_fg_comp] : nil;
+    if (!fi) { MLOG("[RED] frame generation: MetalFX makes no frame interpolator for %lux%lu format %lu; frames of this size are shown as the game draws them", (unsigned long)col.width, (unsigned long)col.height, (unsigned long)col.pixelFormat); return nil; }
+    MTLTextureDescriptor *dd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float width:iw height:ih mipmapped:NO];
+    dd.storageMode = MTLStorageModePrivate; dd.usage = fi.depthTextureUsage | MTLTextureUsageRenderTarget;
+    MTLTextureDescriptor *md = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRG16Float width:iw height:ih mipmapped:NO];
+    md.storageMode = MTLStorageModePrivate; md.usage = fi.motionTextureUsage | MTLTextureUsageRenderTarget | (mv ? MTLTextureUsageShaderWrite : 0);
+    id<MTLTexture> dep = [g_dev newTextureWithDescriptor:dd], mot = [g_dev newTextureWithDescriptor:md];
+    if (!dep || !mot) { RED_ONCE(180, "frame generation: no depth or motion texture"); return nil; }
+    if (mv) {   // fg_motion's tiles (8x8 of the 1/8 pixels each) and fg_keep's 4x4 px blocks
+        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float width:(iw + 7) / 8 height:(ih + 7) / 8 mipmapped:NO];
+        td.storageMode = MTLStorageModePrivate; td.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+        MTLTextureDescriptor *bd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR16Float width:(col.width + 3) / 4 height:(col.height + 3) / 4 mipmapped:NO];
+        bd.storageMode = MTLStorageModePrivate; bd.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+        MTLTextureDescriptor *pd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Unorm width:col.width height:col.height mipmapped:NO];
+        pd.storageMode = MTLStorageModePrivate; pd.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+        MTLTextureDescriptor *cd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR16Float width:iw height:ih mipmapped:NO];
+        cd.storageMode = MTLStorageModePrivate; cd.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+        id<MTLTexture> tl = [g_dev newTextureWithDescriptor:td], sb = [g_dev newTextureWithDescriptor:bd], kb = [g_dev newTextureWithDescriptor:bd], pm = [g_dev newTextureWithDescriptor:pd], cf = [g_dev newTextureWithDescriptor:cd];
+        if (!tl || !sb || !kb || !pm || !cf) { RED_ONCE(180, "frame generation: no textures for the motion"); return nil; }
+        [g_snap_res addAllocation:tl]; [g_snap_res addAllocation:sb]; [g_snap_res addAllocation:kb]; [g_snap_res addAllocation:pm]; [g_snap_res addAllocation:cf];
+        g_fg_tiles = tl; g_fg_still = sb; g_fg_keep = kb; g_fg_pmask = pm; g_fg_conf = cf;
+    }
+    // The ones they replace stay resident: a generation committed before this one may still read them (they are tiny, and a size change is rare)
+    [g_snap_res addAllocation:dep]; [g_snap_res addAllocation:mot]; [g_snap_res commit];
+    g_fg_depth = dep; g_fg_motion = mot; g_fg_clear = 1; g_fg_fi = fi; g_fg_bad = 0; g_fg_warm = 0;
+    if (!g_fg_heap) { MTL4CounterHeapDescriptor *hd = [MTL4CounterHeapDescriptor new]; hd.type = MTL4CounterHeapTypeTimestamp; hd.count = 2 * SNAP_MAX;
+        g_fg_heap = [g_dev newCounterHeapWithDescriptor:hd error:&err]; g_fg_tsbuf = [g_dev newBufferWithLength:8 options:MTLResourceStorageModePrivate];
+        if (g_fg_tsbuf) { [g_snap_res addAllocation:g_fg_tsbuf]; [g_snap_res commit]; }
+        if (!g_fg_heap || !g_fg_tsbuf) { MLOG("frame generation: no timestamp heap (%s): its GPU time is not logged", err.description.UTF8String); g_fg_heap = nil; } }
+    MLOG("frame generation: MetalFX frame interpolator %lux%lu format %lu (depth and motion %lux%lu%s), made in %.1f ms", (unsigned long)col.width, (unsigned long)col.height,
+         (unsigned long)col.pixelFormat, (unsigned long)iw, (unsigned long)ih, mv ? (fg_keep_fmt(col.pixelFormat) ? ", motion found, HUD kept" : ", motion found; this format cannot be written, the HUD is not kept") : "", (now_ns() - t0) / 1e6);
+    return fi;
+}
+// With frame generation, a picture shown smaller than the game draws it (an iPhone: a 3136x1440 picture on a 2622x1206 screen) is copied at the size it is shown at, and
+// both its own picture and the generated frames come from that copy: the interpolation's cost follows its pixels (on an M5 about 4 ms at 1920x1080, 5-7 ms at 2560x1440
+// and 3136x1440), and the present pass would have scaled the picture down to that size anyway. The copy holds the present's crop rectangle alone (the present shows all of
+// it then): Ocarina of Time passes the window's crop with every present, and with crops left out its generated frames stayed at 3136x1440 on an iPhone whose screen is 2622x1206 (log 73).
+// cw, ch: the picture's size (its crop); 1 with *tw, *th the copy's size when the picture is shown at 95 % of it or less
+// The size it works at follows a pixel budget: a picture shown with more than 1920x1080 pixels (Wide view's 2352x1080 on an iPhone, an iPad, an external screen) is copied that much
+// smaller, at least 0.75 of its shown size, and the present's bilinear pass brings it back to the shown size (MetalFX's spatial scaler only for DM_FRAMEGEN_SCALE, fx_mode). The interpolation's cost follows its
+// pixels: on an iPhone 18 Pro Max with Wide view its GPU time was 8-13 ms a generated frame (p50) at 2352x1080 against 5-10 ms at 1920x1080 (logs 7 and 9), enough with the game's own
+// 11-28 ms to drop frames and stop the interpolation nine times in five minutes. The launcher's Frame generation size row (Full / Lighter) is gone: DM_FRAMEGEN_SCALE (0.5 to 1)
+// remains, to measure, as a fixed factor in place of the budget.
+// The budget is 1440x810 and steps down while frames keep dropping (g_fg_level, fg_level_down): at 1920x1080 the interpolation took 5-10 ms of GPU time a generated frame
+// (p95 16 ms) on an iPhone where the game's own frame took 28-30 ms in Hyrule Field, and the two did not fit in 33 ms: frames dropped and the interpolation stopped 11 times
+// in two minutes, the picture switching between 60 and 30 each time (FF2, log 15; the same run without frame generation dropped next to none). Its cost follows its pixels,
+// so 1440x810 (0.75 of a 16:9 phone picture, 56 % of the pixels) costs about half. Its own pictures come from the same copy (fg_shown_size), so they are that size too, brought
+// back by the present's bilinear pass. Steps (g_fg_budget): 1440x810, 1200x675, 960x540, never below 0.5 of the size shown
+static double fg_fixed(void) {   // DM_FRAMEGEN_SCALE, or 0 for the budget
+    static double v = -1; if (v >= 0) return v;
+    const char *e = getenv("DM_FRAMEGEN_SCALE"); double x = e && *e ? atof(e) : 0;
+    v = !(e && *e) ? 0 : x >= 0.5 && x <= 1 ? x : 1;
+    if (e && *e && v != x) MLOG("[RED] DM_FRAMEGEN_SCALE=%s: 0.5 to 1; using %.2f", e, v);
+    if (v) MLOG("frame generation: its frames at %.2f of the size shown (DM_FRAMEGEN_SCALE) in place of the pixel budget", v);
+    return v;
+}
+static double fg_size_at(double px, int level) {   // the budget's factor at a step for a picture of px pixels: within 10 % of the budget, as shown (not worth the pass)
+    double b = g_fg_budget[level < 0 ? 0 : level >= FG_LEVELS ? FG_LEVELS - 1 : level];
+    return px <= 1.1 * b ? 1 : fmax(0.5, sqrt(b / px));
+}
+static double fg_size_for(double w, double h) {   // the factor for a picture shown at w x h
+    double f = fg_fixed(); if (f) return f;
+    return fg_size_at(w * h, atomic_load(&g_fg_level));
+}
+// Frames keep dropping (the display link, under g_pq_mu): the next step of the budget, when it makes the last picture's frames smaller; 0 when there is none (the
+// interpolation then stays at its lightest and keeps running). The step is made from the next snapshot on (a new size starts the interpolation's history again: one present without a generated frame)
+// Only while the interpolation's own GPU time is heavy (its average at least DM_FRAMEGEN_HEAVY_MS, default 8): −1 otherwise, and its frames keep their size. Dropped frames alone
+// did not say the interpolation was their cause: on a hot iPhone 18 Pro at 30 fps (FF7, log 22, thermal 1 from 17 s) the game's own frame ran late (submit 20-23 ms of wall clock,
+// p95 35-38 ms against 33.3, CPU at 1.7-2.5 GHz) while the interpolation took 1.5-5.3 ms; the budget stepped down to 960x540 within 10 s and stayed there, its frames generated at
+// half the size shown (a blurred, unsteady in-between picture), and frames dropped as often after as before (37, 46, 38 in 300). FF2's case is still met: 5-10 ms a frame, p95 16
+static double fg_heavy_ms(void) { static double v = -1; if (v < 0) { const char *e = getenv("DM_FRAMEGEN_HEAVY_MS"); v = e && *e ? atof(e) : 8; if (e && *e) MLOG("frame generation: made lighter only while the interpolation takes %.1f ms or more (DM_FRAMEGEN_HEAVY_MS)", v); } return v; }
+static int fg_level_down(void) {
+    int l = atomic_load(&g_fg_level); double px = (double)atomic_load(&g_fg_shown_px);
+    if (!fg_fixed() && atomic_load(&g_fg_gpu_avg_us) < fg_heavy_ms() * 1000) return -1;
+    if (fg_fixed() || l + 1 >= FG_LEVELS || !px || !(fg_size_at(px, l + 1) < fg_size_at(px, l))) return 0;
+    atomic_store(&g_fg_level, l + 1); return 1;
+}
+static double fg_size(void) {   // the factor for the screen (the drawable), as fx_mode asks before the first picture: below 1 when frames may be made smaller than shown
+    CAMetalLayer *layer = (__bridge CAMetalLayer *)front_metal_layer(); CGSize ds = layer ? layer.drawableSize : CGSizeZero;
+    return ds.width >= 16 && ds.height >= 16 ? fg_size_for(ds.width, ds.height) : fg_fixed() ? fg_fixed() : 1;
+}
+static int fg_shown_size(NSUInteger cw, NSUInteger ch, NSUInteger *tw, NSUInteger *th) {
+    CAMetalLayer *layer = (__bridge CAMetalLayer *)front_metal_layer(); if (!layer || !cw || !ch) return 0;
+    CGSize ds = layer.drawableSize; if (ds.width < 16 || ds.height < 16) return 0;
+    double s = fmin(fmin(ds.width / cw, ds.height / ch), 1);   // fitted into the drawable, as the present draws it; never larger than the crop
+    atomic_store(&g_fg_shown_px, (uint64_t)(cw * s * ch * s));
+    double f = fg_size_for(cw * s, ch * s); s *= f;   // the pixel budget (or DM_FRAMEGEN_SCALE)
+    static double lf = -1; if (f != lf) { lf = f; if (f < 1) MLOG("frame generation: a picture shown at %.0fx%.0f is generated at %.2f of it (%lux%lu; %s%s), brought back by the present", cw * s / f, ch * s / f, f, (unsigned long)lround(cw * s), (unsigned long)lround(ch * s),
+                                                       fg_fixed() ? "DM_FRAMEGEN_SCALE" : "pixel budget ", fg_fixed() ? "" : g_fg_budget_name[atomic_load(&g_fg_level)]); }
+    if (!(s < 0.95) || s < 0.25) return 0;
+    *tw = MAX((NSUInteger)lround(cw * s), 16); *th = MAX((NSUInteger)lround(ch * s), 16); return 1;
+}
+static id<MTLRenderPipelineState> g_fg_scale_pso; static MTLPixelFormat g_fg_scale_fmt; static id<MTL4ArgumentTable> g_fg_args; static id<MTLSamplerState> g_fg_samp;
+static id<MTLBuffer> g_fg_uv[SNAP_MAX];   // per ring slot: the present shader's rectangle (a slot is reused only once its copy has run, snap_take)
+// src's rectangle r (x, y, w, h) drawn into ring slot k's whole dst, which is smaller, with the present's shader and linear filtering, in place of the snapshot's copy
+// (fg_shown_size); 0 when it cannot be
+static int fg_scale(id<MTL4CommandBuffer> cb, int k, id<MTLTexture> src, id<MTLTexture> dst, const NSUInteger r[4]) {
+    NSError *e = nil;
+    if (!g_fg_scale_pso || g_fg_scale_fmt != dst.pixelFormat) {
+        id<MTLLibrary> lib = host_lib("present", &e);
+        MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+        pd.vertexFunction = [lib newFunctionWithName:@"vs"]; pd.fragmentFunction = [lib newFunctionWithName:@"fs"]; pd.colorAttachments[0].pixelFormat = dst.pixelFormat;
+        g_fg_scale_pso = lib ? [g_dev newRenderPipelineStateWithDescriptor:pd error:&e] : nil; g_fg_scale_fmt = dst.pixelFormat;
+        if (!g_fg_scale_pso) { RED_ONCE(183, "frame generation: no pipeline to copy the picture at its shown size (format %lu): %s", (unsigned long)dst.pixelFormat, e.description.UTF8String); return 0; }
+    }
+    if (!g_fg_args) {
+        MTL4ArgumentTableDescriptor *ad = [MTL4ArgumentTableDescriptor new]; ad.maxTextureBindCount = 1; ad.maxSamplerStateBindCount = 1; ad.maxBufferBindCount = 1;
+        g_fg_args = [g_dev newArgumentTableWithDescriptor:ad error:&e];
+        MTLSamplerDescriptor *sd = [MTLSamplerDescriptor new]; sd.minFilter = sd.magFilter = MTLSamplerMinMagFilterLinear; sd.supportArgumentBuffers = YES;
+        g_fg_samp = [g_dev newSamplerStateWithDescriptor:sd];
+        if (!g_fg_args || !g_fg_samp) { RED_ONCE(183, "frame generation: no argument table to copy the picture at its shown size"); g_fg_args = nil; return 0; }
+    }
+    if (!g_fg_uv[k]) { g_fg_uv[k] = [g_dev newBufferWithLength:sizeof(float) * 8 options:MTLResourceStorageModeShared]; if (!g_fg_uv[k]) return 0; [g_snap_res addAllocation:g_fg_uv[k]]; [g_snap_res commit]; }
+    float *uv = g_fg_uv[k].contents; float w = (float)src.width, h = (float)src.height;
+    uv[0] = r[0] / w; uv[1] = r[1] / h; uv[2] = r[2] / w; uv[3] = r[3] / h;   // as present_encode_m4's crop constants
+    uv[4] = (r[0] + 0.5f) / w; uv[5] = (r[1] + 0.5f) / h; uv[6] = (r[0] + r[2] - 0.5f) / w; uv[7] = (r[1] + r[3] - 0.5f) / h;
+    MTL4RenderPassDescriptor *rp = [MTL4RenderPassDescriptor new];
+    rp.colorAttachments[0].texture = dst; rp.colorAttachments[0].loadAction = MTLLoadActionDontCare; rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    id<MTL4RenderCommandEncoder> en = [cb renderCommandEncoderWithDescriptor:rp];
+    if (!en) { RED_ONCE(183, "frame generation: no render encoder to copy the picture at its shown size"); return 0; }
+    [en barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageFragment visibilityOptions:resource_vis()];   // after the frame's work and the slot's last present
+    [en setArgumentTable:g_fg_args atStages:MTLRenderStageFragment];
+    [g_fg_args setTexture:src.gpuResourceID atIndex:0]; [g_fg_args setSamplerState:g_fg_samp.gpuResourceID atIndex:0]; [g_fg_args setAddress:g_fg_uv[k].gpuAddress atIndex:0];
+    [en setViewport:(MTLViewport){0, 0, dst.width, dst.height, 0, 1}]; [en setRenderPipelineState:g_fg_scale_pso];
+    [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [en barrierAfterStages:MTLStageFragment beforeQueueStages:MTLStageAll visibilityOptions:resource_vis()];   // the game's next writes to its texture come after this read
+    [en endEncoding];
+    return 1;
+}
+// The GPU time of an interpolation (between timestamps around it in the snapshot's command buffer, read by its commit feedback: the command buffer's own times also hold
+// its wait for the frame's work, 20 ms a frame on the Mac against 5-7 ms of interpolation), every 600 as p50 / p95 / max: what frame generation costs the GPU on the
+// device it runs on (log.txt on an iPhone)
+static void fg_gpu_note(double s) {
+    g_fg_gpu_last = s;
+    if (s > 0 && s < 1) { uint64_t a = atomic_load(&g_fg_gpu_avg_us), us = (uint64_t)(s * 1e6); atomic_store(&g_fg_gpu_avg_us, a ? (a * 15 + us) / 16 : us); }
+    static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER; static double v[600]; static int n;
+    if (!(s > 0 && s < 1)) return;
+    pthread_mutex_lock(&mu);
+    v[n++] = s * 1e3;
+    if (n == 600) {
+        for (int i = 1; i < 600; i++) { double x = v[i]; int j = i - 1; while (j >= 0 && v[j] > x) { v[j + 1] = v[j]; j--; } v[j + 1] = x; }
+        MLOG("frame generation: GPU time of the interpolation over 600 generated frames: p50 %.3f ms, p95 %.3f ms, max %.3f ms (%lux%lu)", v[299], v[569], v[599], (unsigned long)g_fg_key[1], (unsigned long)g_fg_key[2]);
+        n = 0;
+    }
+    pthread_mutex_unlock(&mu);
+}
+// Slot k's picture at 1/8 size as luma (fgmv_luma), after its copy in cb: the next present's motion search reads it as the picture before (fg_motion). Every present's,
+// also one that generates no frame, so the next one has it
+static void fg_luma(id<MTL4CommandBuffer> cb, int k) {
+    id<MTLTexture> col = g_snap[k].tex, l = g_snap[k].lum;
+    NSUInteger w = MAX((col.width + 7) / 8, 16), h = MAX((col.height + 7) / 8, 16);
+    if (!l || l.width != w || l.height != h) {
+        MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR16Float width:w height:h mipmapped:NO];
+        d.storageMode = MTLStorageModePrivate; d.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+        g_snap[k].lum_old = l;   // resident until the slot's next use (snap_take)
+        if (!(l = [g_dev newTextureWithDescriptor:d])) { g_snap[k].lum = nil; RED_ONCE(185, "frame generation: no luma texture for the motion"); return; }
+        [g_snap_res addAllocation:l]; [g_snap_res commit]; g_snap[k].lum = l;
+    }
+    id<MTL4ComputeCommandEncoder> ce = [cb computeCommandEncoder];
+    [ce barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageDispatch visibilityOptions:resource_vis()];   // after the copy
+    [ce setArgumentTable:g_fgmv_args]; fgmv_bind(ce, FGMV_LUMA, col, l, nil, nil); fgmv_grid(ce, w, h);
+    [ce barrierAfterStages:MTLStageDispatch beforeQueueStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionDevice];
+    [ce endEncoding];
+}
+// The motion from slot pk's picture to slot k's into the interpolator's motion texture (fgmv_search, fgmv_pick), in ce after its barrier
+static void fg_motion(id<MTL4ComputeCommandEncoder> ce, int k, int pk) {
+    id<MTLTexture> cl = g_snap[k].lum, pl = g_snap[pk].lum;
+    [ce setArgumentTable:g_fgmv_args];
+    fgmv_bind(ce, FGMV_SEARCH, cl, pl, g_fg_tiles, nil);
+    [ce dispatchThreadgroups:MTLSizeMake(g_fg_tiles.width, g_fg_tiles.height, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    fgmv_step(ce);
+    fgmv_bind(ce, FGMV_PICK, cl, pl, g_fg_tiles, g_fg_motion); fgmv_grid(ce, g_fg_motion.width, g_fg_motion.height);
+}
+// After the interpolation: the still detailed pixels of slot k's picture, and still ones near them (a HUD), written over the generated frame (fgmv_still, fgmv_hud, fgmv_keep)
+static void fg_keep(id<MTL4CommandBuffer> cb, int k, int pk, id<MTLTexture> gen) {
+    id<MTLTexture> col = g_snap[k].tex, prev = g_snap[pk].tex, prev2 = prev;   // prev2: the present before prev, when a ring slot holds it (fgmv_pstill)
+    for (int i = 0; i < g_snap_n; i++) if (i != k && i != pk && g_snap[i].seq + 2 == g_snap[k].seq && g_snap[i].tex.width == col.width && g_snap[i].tex.height == col.height && g_snap[i].tex.pixelFormat == col.pixelFormat) prev2 = g_snap[i].tex;
+    id<MTL4ComputeCommandEncoder> ce = [cb computeCommandEncoder];
+    [ce barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageDispatch visibilityOptions:resource_vis()];   // after MetalFX's encoders
+    [ce setArgumentTable:g_fgmv_args];
+    fgmv_bind(ce, FGMV_STILL, col, prev, g_fg_still, nil); fgmv_grid(ce, g_fg_still.width, g_fg_still.height); fgmv_step(ce);
+    fgmv_bind(ce, FGMV_CONF, g_snap[k].lum, g_snap[pk].lum, g_fg_motion, g_fg_conf); fgmv_grid(ce, g_fg_conf.width, g_fg_conf.height); fgmv_step(ce);
+    fgmv_bind(ce, FGMV_HUD, g_fg_still, g_fg_keep, g_fg_conf, nil); fgmv_grid(ce, g_fg_keep.width, g_fg_keep.height); fgmv_step(ce);
+    fgmv_bind(ce, FGMV_PSTILL, col, prev, prev2, g_fg_pmask); fgmv_grid(ce, col.width, col.height); fgmv_step(ce);
+    fgmv_bind(ce, FGMV_KEEP, col, g_fg_keep, gen, g_fg_pmask); [g_fgmv_args setTexture:g_fg_motion.gpuResourceID atIndex:4]; fgmv_grid(ce, gen.width, gen.height);
+    [ce barrierAfterStages:MTLStageDispatch beforeQueueStages:MTLStageAll visibilityOptions:resource_vis()];   // the present reads gen
+    [ce endEncoding];
+}
+// After slot k's copy in cb: the frame between the previous present (slot pk, when it holds the present just before) and slot k's into slot k's gen texture.
+// Sets g_snap[k].gen_ok when the texture holds one to show. period: the present's interval (seconds)
+static void fg_encode(id<MTL4CommandBuffer> cb, int k, int pk, double period) {
+    g_snap[k].gen_ok = 0;
+    id<MTLTexture> col = g_snap[k].tex, prev = pk >= 0 ? g_snap[pk].tex : nil;
+    id<MTL4FXFrameInterpolator> fi = fg_for(col);
+    if (!fi) return;
+    int follows = prev && g_snap[pk].seq + 1 == g_snap[k].seq && prev.width == col.width && prev.height == col.height && prev.pixelFormat == col.pixelFormat;
+    int mv = fg_mv_on() && g_fg_tiles && g_snap[k].lum && g_snap[pk].lum && g_snap[k].lum.width == g_snap[pk].lum.width && g_snap[k].lum.height == g_snap[pk].lum.height;
+    int keep = mv && fg_keep_fmt(col.pixelFormat);
+    if (!follows) {   // nothing to generate from: the history starts again with this present (the next one interpolates from it)
+        if (g_fg_warm) g_fg_resets++;
+        g_fg_warm = 0; return;
+    }
+    id<MTLTexture> gen = g_snap[k].gen;
+    if (!gen || gen.width != col.width || gen.height != col.height || gen.pixelFormat != col.pixelFormat) {
+        MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:col.pixelFormat width:col.width height:col.height mipmapped:NO];
+        d.storageMode = MTLStorageModePrivate; d.usage = fi.outputTextureUsage | MTLTextureUsageShaderRead | (fg_mv_on() && fg_keep_fmt(col.pixelFormat) ? MTLTextureUsageShaderWrite : 0);
+        g_snap[k].gen_old = gen;   // resident until the slot's next use, as the slot's old texture (snap_take)
+        gen = [g_dev newTextureWithDescriptor:d]; if (!gen) { RED_ONCE(181, "frame generation: no texture for the generated frame"); return; }
+        [g_snap_res addAllocation:gen]; [g_snap_res commit];
+        if (!g_snap[k].gen_serial) { static _Atomic uint64_t n; g_snap[k].gen_serial = (1ull << 61) + (1ull << 40) + atomic_fetch_add(&n, 1) + 1; }
+        serial_put(g_snap[k].gen_serial, gen); g_snap[k].gen = gen;
+    }
+    if (g_fg_clear) {   // the depth (constant: far, 0 reversed) and the motion (none until fg_motion writes it)
+        MTL4RenderPassDescriptor *rp = [MTL4RenderPassDescriptor new];
+        rp.colorAttachments[0].texture = g_fg_motion; rp.colorAttachments[0].loadAction = MTLLoadActionClear; rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+        rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
+        rp.depthAttachment.texture = g_fg_depth; rp.depthAttachment.loadAction = MTLLoadActionClear; rp.depthAttachment.storeAction = MTLStoreActionStore; rp.depthAttachment.clearDepth = 0;
+        id<MTL4RenderCommandEncoder> en = [cb renderCommandEncoderWithDescriptor:rp];
+        if (!en) { RED_ONCE(182, "frame generation: the constant inputs could not be cleared"); return; }
+        [en endEncoding]; g_fg_clear = 0;
+    }
+    // MetalFX opens encoders of its own, which take no barrier: one that waits for the copy (and the clear) and that the interpolation waits for, as dlss_eval
+    // (the motion search runs in it too, after the timestamp: its GPU time is in the interpolation's)
+    id<MTL4ComputeCommandEncoder> ce = [cb computeCommandEncoder];
+    [ce barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageBlit | MTLStageDispatch visibilityOptions:resource_vis()];
+    if (g_fg_heap) { [ce copyFromBuffer:g_fg_tsbuf sourceOffset:0 toBuffer:g_fg_tsbuf destinationOffset:4 size:4]; [ce writeTimestampWithGranularity:MTL4TimestampGranularityPrecise intoHeap:g_fg_heap atIndex:2 * k]; }
+    if (mv) fg_motion(ce, k, pk);
+    [ce barrierAfterStages:MTLStageBlit | MTLStageDispatch beforeQueueStages:MTLStageAll visibilityOptions:resource_vis()];
+    [ce endEncoding];
+    fi.colorTexture = col; fi.prevColorTexture = prev; fi.outputTexture = gen;
+    fi.depthTexture = g_fg_depth; fi.motionTexture = g_fg_motion; fi.motionVectorScaleX = 1; fi.motionVectorScaleY = 1;
+    fi.deltaTime = (float)period; fi.nearPlane = 0.1f; fi.farPlane = 1000; fi.fieldOfView = 60; fi.aspectRatio = (float)col.width / (float)col.height;
+    fi.jitterOffsetX = 0; fi.jitterOffsetY = 0; fi.depthReversed = YES;
+    fi.shouldResetHistory = g_fg_warm == 0;
+    [fi encodeToCommandBuffer:cb];
+    if (keep) fg_keep(cb, k, pk, gen);
+    if (g_fg_heap) {   // after everything the interpolation ran (and the HUD kept)
+        id<MTL4ComputeCommandEncoder> te = [cb computeCommandEncoder];
+        [te barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageBlit visibilityOptions:MTL4VisibilityOptionNone];   // the copy below is a blit
+        [te copyFromBuffer:g_fg_tsbuf sourceOffset:4 toBuffer:g_fg_tsbuf destinationOffset:0 size:4];
+        [te writeTimestampWithGranularity:MTL4TimestampGranularityPrecise intoHeap:g_fg_heap atIndex:2 * k + 1];
+        [te endEncoding];
+    }
+    // The first two after a new start are the new frame unchanged (probe above): shown from the third on
+    g_snap[k].gen_ok = ++g_fg_warm >= 3;
+    if (g_snap[k].gen_ok && !(++g_fg_made % 1800))
+        MLOG("frame generation: %llu frames generated, the history started again %llu times", (unsigned long long)g_fg_made, (unsigned long long)g_fg_resets);
 }
 static void snap_commit_wait(uint64_t v) { if (v) rec_note_wait(&g_snap_cmt, v); }
 static void snap_drain(int strict) {
@@ -20686,8 +21362,31 @@ uint64_t mtl_snap_acquire_wait(void) {
     if (ws_on()) ws_put(WS_SNAP, w0, blocked);
     return ws_t0() - w0;
 }
-// Copy the presented texture into the next ring slot; returns the slot's serial (0 = no snapshot: the game's texture is presented as before)
-static uint64_t snap_take(const tex_t *t) {
+// Copy the presented texture into the next ring slot; returns the slot's serial (0 = no snapshot: the game's texture is presented as before). period: the present's interval
+// (seconds), for frame generation, which follows the copy (fg_encode)
+// Frame generation pauses in the game's menus (DM_FRAMEGEN_MENU_PAUSE, default 1; 0 = never). Logs 24 and 26 (FF10, FF11 on an iPhone 18 Pro): the GPU hung seconds after
+// Ocarina of Time's pause menu opened, with frame generation on, and the process lost the GPU; with frame generation off the owner opened the menu many times without a hang.
+// The menu is told from what the game draws: about 180 draws a frame against 1,000-2,500 in the world (a Mac route's play never went under 1,100; the title, file select and
+// loading under 300). Below FG_MENU_DRAWS for FG_MENU_IN presents in a row the interpolation stops (each present shown on both ticks, as at 60 fps), and FG_MENU_OUT presents at
+// or above it start it again (its history restarts: generated frames show from the third, fg_encode). Only once the game has drawn FG_MENU_ARM presents at or above it (about
+// 30 s of play), so the title screen and the opening cutscene keep their generated frames (the owner's wish)
+enum { FG_MENU_DRAWS = 300, FG_MENU_IN = 6, FG_MENU_OUT = 2, FG_MENU_ARM = 900 };
+static int g_fg_paused; static uint64_t g_fg_pd_last, g_fg_pauses; static int g_fg_low, g_fg_high, g_fg_armed;
+static int fg_menu_pause(void) {
+    static int on = -1; if (on < 0) { const char *e = getenv("DM_FRAMEGEN_MENU_PAUSE"); on = !e || atoi(e) != 0; MLOG("frame generation: %s (DM_FRAMEGEN_MENU_PAUSE)", on ? "pauses in the game's menus (under 300 draws a frame, after 30 s of play)" : "never pauses in menus"); }
+    uint64_t d = __atomic_load_n(&g_stat_draw, __ATOMIC_RELAXED), n = d - g_fg_pd_last; g_fg_pd_last = d;   // draws since the last present (the replay thread counts them)
+    if (!on) return 0;
+    uint64_t f = atomic_load(&g_cur_frame);
+    if (n >= FG_MENU_DRAWS) {
+        g_fg_low = 0; if (g_fg_armed < FG_MENU_ARM && ++g_fg_armed == FG_MENU_ARM) MLOG("frame generation: menu pause armed at frame %llu (30 s of play)", (unsigned long long)f);
+        if (g_fg_paused && ++g_fg_high >= FG_MENU_OUT) { g_fg_paused = 0; g_fg_high = 0; if (g_fg_pauses <= 200) MLOG("frame generation: resumed at frame %llu (%llu draws a frame)", (unsigned long long)f, (unsigned long long)n); }
+    } else {
+        g_fg_high = 0;
+        if (!g_fg_paused && g_fg_armed >= FG_MENU_ARM && ++g_fg_low >= FG_MENU_IN) { g_fg_paused = 1; g_fg_low = 0; if (++g_fg_pauses <= 200) MLOG("frame generation: paused at frame %llu, a menu (%llu draws a frame); pause %llu", (unsigned long long)f, (unsigned long long)n, (unsigned long long)g_fg_pauses); }
+    }
+    return g_fg_paused;
+}
+static uint64_t snap_take(const tex_t *t, double period, const int crop[4], int *whole) {
     int k = (int)(atomic_load(&g_snap_next) % (uint64_t)g_snap_n);
     pthread_mutex_lock(&g_pq_mu); int busy = atomic_load(&g_snap[k].ticket) > g_pq_done; pthread_mutex_unlock(&g_pq_mu);
     uint64_t ev = atomic_load(&g_snap[k].ev);
@@ -20695,6 +21394,9 @@ static uint64_t snap_take(const tex_t *t) {
     // The texture this slot held before it was last replaced: every present that read it had been committed when the replacing copy was (the busy check then), and the queue
     // signals g_snap_ev only after all work committed before the signal, so those presents have run and it can leave the residency set
     if (g_snap[k].old) { [g_snap_res removeAllocation:g_snap[k].old]; [g_snap_res commit]; g_snap[k].old = nil; }
+    if (g_snap[k].gen_old) { [g_snap_res removeAllocation:g_snap[k].gen_old]; [g_snap_res commit]; g_snap[k].gen_old = nil; }
+    if (g_snap[k].lum_old) { [g_snap_res removeAllocation:g_snap[k].lum_old]; [g_snap_res commit]; g_snap[k].lum_old = nil; }
+    g_snap[k].gen_ok = 0;
     id<MTLTexture> src = tex_mtl(t); if (!src) return 0;
     // The copy reads the source before present_now runs, so it needs the same commit as present_now: a window texture presented before any submission has used it was made just
     // now and is outside the committed residency set. DRAGON QUEST XI S presents three times before its first submission; on an A17 Pro the copy faulted silently (its command buffer
@@ -20708,10 +21410,20 @@ static uint64_t snap_take(const tex_t *t) {
             if (!g_snap_alloc[i] || !g_snap_cb[i]) MDIE("present snapshots: no command allocator / buffer");
         }
     }
+    // With frame generation, the picture at the size it is shown at (fg_shown_size), its crop only: *whole tells the present to show all of the copy. Not with a lower-left
+    // origin, whose present flips the picture (a crop there is measured in the flipped texture)
+    // A crop shown at its size or larger is copied alone, 1:1 (sub): Ocarina of Time draws 2352x1080 into a 3136x1440 window texture and crops to it, and with the whole
+    // texture copied its frames were generated at 3136x1440, 44 % of it never shown (log 75: interpolation p50 13-15 ms beside 14-16 ms of the game's own GPU frame, frames dropping)
+    NSUInteger tw = src.width, th = src.height, cr[4];
+    int fgc = fg_on() && !atomic_load_explicit(&g_origin_ll, memory_order_relaxed) && present_crop_rect(src, crop, cr);
+    int scaled = fgc && fg_shown_size(cr[2], cr[3], &tw, &th);
+    int sub = fgc && !scaled && (cr[0] || cr[1] || cr[2] != src.width || cr[3] != src.height);
+    if (!scaled) { tw = sub ? cr[2] : src.width; th = sub ? cr[3] : src.height; }
+    *whole = scaled || sub;
     id<MTLTexture> dst = g_snap[k].tex;
-    if (!dst || dst.width != src.width || dst.height != src.height || dst.pixelFormat != src.pixelFormat) {
-        MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:src.pixelFormat width:src.width height:src.height mipmapped:NO];
-        d.storageMode = MTLStorageModePrivate; d.usage = MTLTextureUsageShaderRead;
+    if (!dst || dst.width != tw || dst.height != th || dst.pixelFormat != src.pixelFormat) {
+        MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:src.pixelFormat width:tw height:th mipmapped:NO];
+        d.storageMode = MTLStorageModePrivate; d.usage = MTLTextureUsageShaderRead | (fg_on() ? MTLTextureUsageRenderTarget : 0);
         // The old texture stays resident (and referenced) until the slot's next use: the busy check above means its last present was committed, not that the GPU has run it,
         // and a texture removed here was sampled outside the residency set by a display command buffer still queued
         g_snap[k].old = dst;
@@ -20719,27 +21431,49 @@ static uint64_t snap_take(const tex_t *t) {
         [g_snap_res addAllocation:dst]; [g_snap_res commit];
         if (!g_snap[k].serial) { static _Atomic uint64_t n; g_snap[k].serial = (1ull << 61) + atomic_fetch_add(&n, 1) + 1; }
         serial_put(g_snap[k].serial, dst); g_snap[k].tex = dst;
-        MLOG("present snapshots: ring slot %d %lux%lu format %lu", k, (unsigned long)dst.width, (unsigned long)dst.height, (unsigned long)dst.pixelFormat);
+        MLOG("present snapshots: ring slot %d %lux%lu format %lu%s", k, (unsigned long)dst.width, (unsigned long)dst.height, (unsigned long)dst.pixelFormat, scaled ? " (the crop at the size it is shown at: frame generation)" : sub ? " (the crop alone: frame generation)" : "");
     }
     [g_snap_alloc[k] reset];
     id<MTL4CommandBuffer> cb = g_snap_cb[k];
     [cb beginCommandBufferWithAllocator:g_snap_alloc[k]];
-    id<MTL4ComputeCommandEncoder> ce = [cb computeCommandEncoder];
-    [ce barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageBlit visibilityOptions:resource_vis()];   // after the frame's work and the slot's last blit to the screen
-    [ce copyFromTexture:src sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(src.width, src.height, 1) toTexture:dst destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
-    [ce barrierAfterStages:MTLStageBlit beforeQueueStages:MTLStageAll visibilityOptions:resource_vis()];   // the game's next writes to its texture come after the copy
-    [ce endEncoding]; cb_end(cb, nil);
+    if (scaled) { if (!fg_scale(cb, k, src, dst, cr)) { cb_end(cb, nil); return 0; } }
+    else {
+        id<MTL4ComputeCommandEncoder> ce = [cb computeCommandEncoder];
+        [ce barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageBlit visibilityOptions:resource_vis()];   // after the frame's work and the slot's last blit to the screen
+        [ce copyFromTexture:src sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(sub ? cr[0] : 0, sub ? cr[1] : 0, 0) sourceSize:MTLSizeMake(tw, th, 1) toTexture:dst destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
+        [ce barrierAfterStages:MTLStageBlit beforeQueueStages:MTLStageAll visibilityOptions:resource_vis()];   // the game's next writes to its texture come after the copy
+        [ce endEncoding];
+    }
+    if (fg_on()) {   // the frame between the previous present and this one (frame generation): only for presents held two ticks or more, as the display link shows it
+        int pk = (int)((atomic_load(&g_snap_next) + (uint64_t)g_snap_n - 1) % (uint64_t)g_snap_n);
+        g_snap[k].seq = g_fg_seq;
+        int paused = fg_menu_pause();   // the game's menus: no interpolation, each present shown on both ticks, as at 60 fps below
+        if (!paused && fg_mv_on()) fg_luma(cb, k);
+        // only for a present the display link holds 1.5 ticks or more, as it shows them (30 fps on a 60 Hz link, 60 fps on the 120 Hz one): not a fixed 25 ms, which left 60 fps out
+        double tick = g_fg_tick > 0 ? g_fg_tick : 1 / 60.0;
+        if (period >= 1.5 * tick - 0.0005 && !paused) fg_encode(cb, k, pk, period); else g_fg_warm = 0;
+    }
+    cb_end(cb, nil);
+    MTL4CommitOptions *o = nil;
+    if (g_snap[k].gen_ok && g_fg_heap) {
+        o = [MTL4CommitOptions new]; id<MTL4CounterHeap> heap = g_fg_heap; int slot = k;
+        [o addFeedbackHandler:^(id<MTL4CommitFeedback> f) {
+            if (f.error) { MLOG("[RED] frame generation: %s", f.error.description.UTF8String); return; }
+            NSData *r = [heap resolveCounterRange:NSMakeRange(2 * slot, 2)]; const uint64_t *ts = r.bytes;
+            if (ts && ts[1] > ts[0]) fg_gpu_note((ts[1] - ts[0]) * (1.0 / (double)[g_dev queryTimestampFrequency]));
+        }];
+    }
     uint64_t v = ++g_snap_v;
     if (rec_on() && g_rb_started) {   // a block of the encode thread's queue, behind the frame's work (see above)
         if (on_sub_thread()) rec_publish();   // what the submitting thread recorded outside a submission goes first
         rec_blk *b = rec_own_begin();
-        rec_t *r = rec_own_put(b, RO_COMMIT_REAL, 2); r->a[0] = 0; r->a[1] = rec_obj(cb); r->a[2] = (uintptr_t)"encode thread (snapshot copy)";
+        rec_t *r = rec_own_put(b, RO_COMMIT_REAL, 2); r->a[0] = o ? rec_obj(o) : 0; r->a[1] = rec_obj(cb); r->a[2] = (uintptr_t)"encode thread (snapshot copy)";
         r = rec_own_put(b, RO_SIGNAL, 1); r->a[0] = rec_obj(g_snap_ev); r->a[1] = v;
         r = rec_own_put(b, RO_NOTE, 0); r->a[0] = (uint64_t)(uintptr_t)&g_snap_cmt; r->a[1] = v;
         rec_own_push(b);
     } else {
         pthread_mutex_lock(&g_res_commit_mu);
-        uint64_t elapsed = q4_commit_elapsed(&cb, 1, nil);
+        uint64_t elapsed = q4_commit_elapsed(&cb, 1, o);
         [g_q4 signalEvent:g_snap_ev value:v];
         pthread_mutex_unlock(&g_res_commit_mu);
         atomic_store(&g_snap_cmt, v);
@@ -20751,7 +21485,7 @@ static uint64_t snap_take(const tex_t *t) {
 // copy (may be NULL): the g_snap_ev value of the snapshot copy this present took, 0 when it took none (mtl_present_wait_texture)
 static uint64_t present_enqueue(const tex_t *t, double period, const int crop[4], uint64_t ev_val, uint64_t *copy) {
     atomic_store(&dm_present_ns, now_ns()); if (copy) *copy = 0;
-    if (g_classic || atomic_load(&g_present_discard) || atomic_load(&g_present_suspended)) return 0;
+    if (g_classic || atomic_load(&g_present_discard) || atomic_load(&g_present_suspended)) return 0;   // Ticket number 0 = no pending present; the swapchain texture acquire does not wait (g_classic: no Metal 4 queue to present on)
     // A texture whose content comes from its storage is uploaded when it is first resolved (and again when its pages change), in an upload batch only the submit thread may open.
     // Bastion fills both window textures with WriteTexels at boot (main+0x9374) and presents one before drawing into it: resolved on the present thread, the upload aborted the host.
     // Resolve it here, where the game queues the present, and commit the batch, so the display command buffer comes after the upload on the queue and the present thread finds it uploaded.
@@ -20768,10 +21502,10 @@ static uint64_t present_enqueue(const tex_t *t, double period, const int crop[4]
         else if (st == 2 && now - t0 >= at + dur) { st = 3; atomic_store(&g_test_link_hold, 0); mtl_link_pause(0); MLOG("DM_TEST_LINK_STALL: resuming the display link (frame %llu)", (unsigned long long)atomic_load(&g_cur_frame)); }
     }
     if (ws_on()) { static uint64_t f0; uint64_t f = atomic_load(&g_cur_frame); if (!f0) f0 = f; else if (f >= f0 + 300) { ws_report(f, f - f0); f0 = f; } }
-    tex_t snap; uint64_t ss = 0; int slot = 0;
+    tex_t snap; uint64_t ss = 0; int slot = 0, whole = 0;
     if (!ev_val && mtl_snap_on()) {
-        slot = (int)(atomic_load(&g_snap_next) % (uint64_t)g_snap_n);
-        if ((ss = snap_take(t))) { memset(&snap, 0, sizeof snap); snap.magic = MAGIC('T', 'E', 'X', 0); snap.serial = ss; t = &snap; }
+        slot = (int)(atomic_load(&g_snap_next) % (uint64_t)g_snap_n); g_fg_seq++;
+        if ((ss = snap_take(t, period, crop, &whole))) { memset(&snap, 0, sizeof snap); snap.magic = MAGIC('T', 'E', 'X', 0); snap.serial = ss; t = &snap; }
     }
     if (t->serial < EXT_SERIAL) mtl_tex_pin(t->serial);   // an external texture is the present path's until mtl_ext_tex_release, which waits for its presents (the unpins find no pin)
     pthread_mutex_lock(&g_pq_mu);
@@ -20787,11 +21521,14 @@ static uint64_t present_enqueue(const tex_t *t, double period, const int crop[4]
         return 0;
     }
     pq_item *it = &g_pq[g_pq_in % PQ]; *it = (pq_item){*t, period, atomic_load(&g_cur_frame), {0}, CACurrentMediaTime(), ev_val, ss ? g_snap[slot].ev : 0, !ss && !ev_val && on_sub_thread() ? g_fence : 0};
-    if (crop) memcpy(it->crop, crop, sizeof it->crop);   // The current frame's state is enqueued with the ticket number, rather than reading the mutable window late on the present thread
+    if (crop && !(ss && whole)) memcpy(it->crop, crop, sizeof it->crop);   // (a snapshot that holds the crop alone is shown whole) The current frame's state is enqueued with the ticket number, rather than reading the mutable window late on the present thread
+    if (ss && g_snap[slot].gen_ok) it->gen = g_snap[slot].gen_serial;
     uint64_t tk = ++g_pq_in;
     g_pres_tin[tk % PRING] = it->t_in;
     g_pres_frm[tk % PRING] = it->frame;
-    if (ss) { g_snap[slot].ticket = tk; atomic_fetch_add(&g_snap_next, 1); if (copy) *copy = g_snap[slot].ev; }
+    // With frame generation a slot's picture is shown again after its generated frame (fg_owe), and that comes before the next present's on the display link: the slot is
+    // reused once the present after its own has been processed
+    if (ss) { g_snap[slot].ticket = tk + (fg_on() ? 1 : 0); atomic_fetch_add(&g_snap_next, 1); if (copy) *copy = g_snap[slot].ev; }
     pthread_cond_broadcast(&g_pq_cv);
     pthread_mutex_unlock(&g_pq_mu);
     // A snapshot present returns its ticket and, in *copy, its copy: the game's next acquire of this texture waits for the copy (mtl_present_wait_texture), not for the screen

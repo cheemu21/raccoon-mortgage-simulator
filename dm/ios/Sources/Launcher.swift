@@ -13,7 +13,7 @@ private func info(_ key: String) -> Any? { Bundle.main.object(forInfoDictionaryK
 /// Cloud saves: an iCloud Drive folder shared with the Mac app (chosen in its settings window's
 /// Cloud saves too). The host brings the save in from there when the game starts and
 /// sends it there after each save (dm/host/save_sync.h); the folder is a bookmark (CloudSaves.m).
-private struct CloudSavesSection: View {
+struct CloudSavesSection: View {   // also on the themed launcher's Saves page (LauncherDream.swift)
     let checking: Bool
     @State private var folder: String = ""
     @State private var note: String = ""
@@ -97,6 +97,7 @@ private struct DocumentPicker: UIViewControllerRepresentable {
 
 private struct LauncherView: View {
     @ObservedObject var m: LauncherModel
+    let background: UIImage?   // dm/launcher_bg.jpg: the themed layout over it (LauncherDream.swift) in place of the list
     let play: () -> Void
     @State private var memory = os_proc_available_memory()
     @State private var checking = false
@@ -105,23 +106,15 @@ private struct LauncherView: View {
     @State private var asking: SaveSyncReport.Step?
 
     var body: some View {
-        GeometryReader { geometry in
-            // Landscape: the game's name and Play on the left third, the settings beside them; upright (Rotation, an iPad turned), the name and Play above the settings
-            if geometry.size.width >= geometry.size.height {
-                HStack(spacing: 0) {
-                    header(icon: 96)
-                        .padding(16)
-                        .frame(width: geometry.size.width / 3, height: geometry.size.height)
-                    settingsList.frame(width: geometry.size.width * 2 / 3)
-                }
+        Group {
+            if let background {
+                DreamLauncherView(m: m, background: background, icon: appIcon(), version: (info("CFBundleShortVersionString") as? String) ?? "", title: (info("CFBundleDisplayName") as? String) ?? "", memory: memory, checking: checking,
+                                  onPlay: start, onPlayWithoutCloud: { check += 1; go("offline") })
+                    .preferredColorScheme(.light)
             } else {
-                VStack(spacing: 0) {
-                    header(icon: 64).padding(.horizontal, 16).padding(.vertical, 12)
-                    settingsList
-                }
+                plain
             }
         }
-        .preferredColorScheme(.dark)
         .confirmationDialog(SaveSyncReport.chooseTitle, isPresented: isAsking(.choose), titleVisibility: .visible, presenting: report) { r in
             Button(r.localLabel(here: "iPhone")) { go(r.localChoice) }
             Button(r.cloudLabel) { go(r.cloudChoice) }
@@ -147,6 +140,26 @@ private struct LauncherView: View {
         // Rotation turns the screen as soon as it is picked, before Play (front_ios.m dm_rotation_set); the saved pick at once when the screen shows
         .onAppear { if let v = m.values["DM_ROTATION"] { dm_rotation_set(v) } }
         .onChange(of: m.values["DM_ROTATION"]) { _, v in if let v { dm_rotation_set(v) } }
+    }
+
+    private var plain: some View {
+        GeometryReader { geometry in
+            // Landscape: the game's name and Play on the left third, the settings beside them; upright (Rotation, an iPad turned), the name and Play above the settings
+            if geometry.size.width >= geometry.size.height {
+                HStack(spacing: 0) {
+                    header(icon: 96)
+                        .padding(16)
+                        .frame(width: geometry.size.width / 3, height: geometry.size.height)
+                    settingsList.frame(width: geometry.size.width * 2 / 3)
+                }
+            } else {
+                VStack(spacing: 0) {
+                    header(icon: 64).padding(.horizontal, 16).padding(.vertical, 12)
+                    settingsList
+                }
+            }
+        }
+        .preferredColorScheme(.dark)
     }
 
     private func header(icon size: CGFloat) -> some View {
@@ -265,19 +278,26 @@ public func dmShowLauncher(_ viewController: UnsafeMutableRawPointer, _ done: @c
     guard let file = try? JSONDecoder().decode(SettingsFile.self, from: data), !file.settings.isEmpty else { fputs("[RED] launcher: dm/launcher.json cannot be read; starting the game\n", stderr); return false }
     let model = LauncherModel(file.settings)
     gameMenuModel = model   // the in-game menu shows and saves the same choices (GameMenu.swift)
-    if ProcessInfo.processInfo.environment["DM_LAUNCHER"] == "0" { fputs("launcher: off (DM_LAUNCHER=0)\n", stderr); model.applySaved(); return false }
+    if ProcessInfo.processInfo.environment["DM_LAUNCHER"] == "0" { fputs("launcher: off (DM_LAUNCHER=0)\n", stderr); model.applySaved(); ModStore.applyEnv(); return false }
     let parent = Unmanaged<UIViewController>.fromOpaque(viewController).takeUnretainedValue()
     var host: UIViewController?
-    let view = LauncherView(m: model) {
+    // The themed layout's picture (build_ipa.sh: the profile's launcher_bg.jpg), in the program's dm folder or the app's; DM_LAUNCHER_THEME=0 shows the plain list
+    var background: UIImage?
+    if ProcessInfo.processInfo.environment["DM_LAUNCHER_THEME"] != "0" {
+        let dirs = [dir, Bundle.main.resourceURL?.appendingPathComponent("dm")].compactMap { $0 }
+        background = dirs.lazy.compactMap { UIImage(contentsOfFile: $0.appendingPathComponent("launcher_bg.jpg").path) }.first
+    }
+    let view = LauncherView(m: model, background: background) {
         guard let h = host else { return }
         host = nil
         model.apply()
+        ModStore.applyEnv()   // DM_MODS: the mods that are on (Mods.swift)
         h.dismiss(animated: false) { done() }
     }
     let h = DmHostingController(rootView: view)
     h.modalPresentationStyle = .fullScreen
     host = h
     parent.present(h, animated: false)
-    fputs("launcher: \(file.settings.count) settings shown\n", stderr)
+    fputs("launcher: \(file.settings.count) settings shown\(background != nil ? " (themed, launcher_bg.jpg)" : "")\n", stderr)
     return true
 }

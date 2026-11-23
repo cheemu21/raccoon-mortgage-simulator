@@ -109,20 +109,24 @@ t "app: $DM_DISPLAY_NAME $DM_APP_VERSION ($DM_BUNDLE_ID), language $DM_LANG$([ $
 t "generate Gen/ (host sources, embedded modules, tables)"
 rm -rf Gen && mkdir -p Gen/dm || die "mkdir Gen"
 python3 tools/gen_build.py "$DM/host" Gen > Gen/dm.xcconfig || die "gen_build"
+# The code mods' copies of modules (dm/tools/exefs_mods.py: maina, mainab, sdka), embedded beside the modules; the host maps the one the settings call for (loader.c code_mods)
+codemod_copies() { [ -f "$PATCHED/code_mods.tsv" ] && awk -F'\t' '$1 == "variant" { printf " %s%s", $2, $3 }' "$PATCHED/code_mods.tsv"; return 0; }
 if [ -n "${PROGRAMS_TSV:-}" ]; then   # each program's modules under its tag (the host is built over a table of the programs' profiles: the first program's profile lists them, game.py header_multi)
   F=; : > Gen/embed.S
   while IFS= read -r row; do prog_set "$row"
     J=(); [ -f "$(dirname "$ROMFS")/jit/jit.img" ] && J=(--jit "$(dirname "$ROMFS")/jit/jit.img")   # the nn::jit image (dm/tools/jit_capture.py), beside the RomFS
-    F="$F $(python3 tools/gen_embed.py --tag "p$PN" ${J[@]+"${J[@]}"} "$PATCHED" "Gen/embed_p$PN.S" $MODS)" || die "gen_embed (program $PN)"
+    F="$F $(python3 tools/gen_embed.py --tag "p$PN" ${J[@]+"${J[@]}"} "$PATCHED" "Gen/embed_p$PN.S" $MODS $(codemod_copies))" || die "gen_embed (program $PN)"
     cat "Gen/embed_p$PN.S" >> Gen/embed.S && rm "Gen/embed_p$PN.S"
   done < <(prog_rows); prog_back
 else J=(); [ -f "$(dirname "$ROMFS")/jit/jit.img" ] && J=(--jit "$(dirname "$ROMFS")/jit/jit.img")
-  F=$(python3 tools/gen_embed.py ${J[@]+"${J[@]}"} "$PATCHED" Gen/embed.S $MODS) || die "gen_embed"; fi
+  F=$(python3 tools/gen_embed.py ${J[@]+"${J[@]}"} "$PATCHED" Gen/embed.S $MODS $(codemod_copies)) || die "gen_embed"; fi
 echo "OTHER_LDFLAGS = \$(inherited) \$(DM_FRAMEWORKS) $F" >> Gen/dm.xcconfig
 # One program's tables into TD: the rewriter's, the shader tables and the launcher's settings
 program_tables() {
 cp "$PATCHED"/*.fixups.tsv "$PATCHED"/*.gates.tsv "$PATCHED"/*.cuts.tsv "$PATCHED"/*.obs.tsv $TD/ || die "copy rewriter tables"
-if [ -f "$PATCHED/nro.tsv" ]; then cp "$PATCHED/nro.tsv" $TD/ || die "copy the NRO table"; fi   # the NRO modules the game loads with nn::ro (hle_ro.c), embedded by gen_embed.py
+if [ -f "$PATCHED/nro.tsv" ]; then cp "$PATCHED/nro.tsv" $TD/ || die "copy the NRO table"; fi
+if [ -f "$PATCHED/code_mods.tsv" ]; then cp "$PATCHED/code_mods.tsv" $TD/ || die "copy the code mods table"   # switchable code mods (loader.c code_mods) and their romfs
+  if [ -d "$PATCHED/code_mods" ]; then cp -R "$PATCHED/code_mods" $TD/ || die "copy the code mods' romfs"; fi; fi   # the NRO modules the game loads with nn::ro (hle_ro.c), embedded by gen_embed.py
 if [ "$GFXAPI" = vulkan ] || [ "$GFXAPI" = gl ]; then cp "$GD/shader_map.tsv" $TD/ || die "copy shader tables"   # empty NVN table: the NVN layer draws nothing
 else cp "$GD/shader_map.tsv" "$GD/c1_full.tsv" $TD/ || die "copy shader tables"
   if [ -f "$GD/cb_extent.tsv" ]; then cp "$GD/cb_extent.tsv" $TD/ || die "copy cb_extent.tsv"; else t "no $GD/cb_extent.tsv: the host copies whole uniform bindings"; fi
@@ -196,6 +200,17 @@ if [ -f "$ICON" ]; then
   echo "DM_APPICON = AppIcon" >> Gen/dm.xcconfig
   t "app icon: $ICON"
 else t "no app icon ($ICON not found): the home-screen icon stays blank"; fi
+# Launcher background: with a picture, Launcher.swift draws its themed layout over it (LauncherDream.swift: the game's icon in a bubble, Play, quick settings at the sides, the rest in a panel);
+# without one, the plain settings list. The profile's launcher_bg.jpg (or .png), or DM_LAUNCHER_BG; saved as dm/launcher_bg.jpg, at most 2048 pixels on its long side
+LBG=${DM_LAUNCHER_BG:-}; [ -n "$LBG" ] || for f in "$GD/launcher_bg.jpg" "$GD/launcher_bg.png"; do [ -f "$f" ] && { LBG=$f; break; }; done
+if [ -n "$LBG" ]; then
+  [ -f "$LBG" ] || die "launcher background $LBG not found"
+  LW=$(sips -g pixelWidth -g pixelHeight "$LBG" 2>/dev/null | awk '/pixel/ { if ($2 > m) m = $2 } END { print m + 0 }')   # its long side: only a larger picture is scaled down (sips -Z also enlarges)
+  sips -s format jpeg -s formatOptions 88 $([ "$LW" -gt 2048 ] && echo -Z 2048) "$LBG" --out Gen/dm/launcher_bg.jpg > /dev/null || die "sips: cannot convert the launcher background $LBG"
+  t "launcher background: $LBG"
+fi
+# The themed launcher's colours follow the profile's pad_theme (LauncherDream.swift: life = Tomodachi's yellow and orange, island = Animal Crossing's leaf greens)
+python3 "$DM/games/game.py" "$GAME" pad_theme life > Gen/dm/launcher_theme || die "game profile $GD: pad_theme"
 # A prepared Xcode project is signed in Xcode, so it asks for the Increased Memory Limit capability the bigger games need (see the README); DM_ENTITLEMENTS=another plist, or empty for none.
 # The unsigned IPA carries the same request in its executable's ad-hoc signature below; the install tool replaces that signature.
 if [ "$PREPARE_XCODE" = YES ] && [ -n "${DM_ENTITLEMENTS-default}" ]; then

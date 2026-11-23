@@ -58,6 +58,7 @@ enum { STB_LOCAL = 0, STB_WEAK = 2, STV_DEFAULT = 0 };
 // Run-time state of one NSO module
 typedef struct {
     char name[16];
+    char file[16];             // the embedded copy mapped for it: a switchable code mod's (loader.c code_mods: "mainab", its sections and tables); empty = name
     uint8_t *base;             // Start address of the image (including the patch area) in the host address space
     size_t size;
     size_t guest_size;         // Horizon module span through MOD0's page-aligned bss end, excluding rewriter pages

@@ -78,6 +78,8 @@ final class LauncherModel: ObservableObject {
     // setting that cannot do anything is not offered (an upscaler's detail with the upscaler off, rumble strength
     // with rumble off). A row naming a setting this game does not have stays drawn, as it has nothing to hide behind
     func visible(_ s: Setting) -> Bool {
+        // Frame Generation on a GPU without Metal 4's MetalFX frame interpolator: the host notes it at the first start (nvn_mtl.m fg_on), the launcher can't ask the GPU itself
+        if s.env == "DM_FRAMEGEN" && defaults.bool(forKey: "dm.framegen.unsupported") { return false }
         guard let n = s.needs, let eq = n.firstIndex(of: "=") else { return true }
         let key = String(n[n.startIndex..<eq]), want = String(n[n.index(after: eq)...])
         guard let v = values[key] else { return true }

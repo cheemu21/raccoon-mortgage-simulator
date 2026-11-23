@@ -3,4 +3,5 @@
 #import "DmGameMenu.h"
 #import "DmRotation.h"
 #include "save_sync.h"
+#include "mods_api.h"   // Mods.swift: the per-mod check and the import (hle_mods.c)
 int front_screen_max_fps(void);   // front.h, front_ios.m: the Frame rate row offers 40 and 120 only on a 120 Hz screen (LauncherSettings.swift offeredOptions)

@@ -1,4 +1,150 @@
-# nxnative
+<p align="center">
+  <img src="docs/images/icon.jpg" width="168" alt="Raccoon Mortgage Simulator icon">
+</p>
+
+<h1 align="center">Raccoon Mortgage Simulator</h1>
+
+<p align="center">
+  <b>Animal Crossing: New Horizons, running natively on iPhone.</b><br>
+  Built on <a href="https://github.com/seedds/nxnative">nxnative</a>. Bring your own dump: no game files are included.
+</p>
+
+<p align="center">
+  <img alt="Platform" src="https://img.shields.io/badge/platform-iPhone-ffb54d?style=flat-square">
+  <img alt="Game version" src="https://img.shields.io/badge/game-3.0.3-6cbf6b?style=flat-square">
+  <img alt="Frame rate" src="https://img.shields.io/badge/fps-30%20%7C%2060%20%7C%20120%20with%20frame%20gen-7a6fd0?style=flat-square">
+  <img alt="License" src="https://img.shields.io/badge/license-MIT-4a90e2?style=flat-square">
+</p>
+
+<p align="center">
+  <a href="#features">Features</a> ·
+  <a href="#what-you-need">What you need</a> ·
+  <a href="#build-it">Build it</a> ·
+  <a href="#settings">Settings</a> ·
+  <a href="#mods">Mods</a> ·
+  <a href="#credits">Credits</a>
+</p>
+
+---
+
+It is not an emulator: the game's own code runs on the iPhone's chip, and its graphics are rebuilt on Metal. Everything game-specific lives in the game profile, [`dm/games/01006F8002326000`](dm/games/01006F8002326000/README.md).
+
+> [!NOTE]
+> Tested on an iPhone 18 Pro, sideloaded with LiveContainer. Older iPhones (A14 to A16) are supported by the texture conversion below but have not been tested.
+
+## Features
+
+| | |
+|---|---|
+| 🌿 **Island touch controls** | Transparent controls with a fat cat stick that squishes against its ring, a leaf D-pad, a stick you can grab anywhere below it, and a hidden right stick on the right half of the screen. A touch key at the top right hands the screen to the game. |
+| 🏪 **Nook's Cranny launcher** | A themed start screen with quick tiles for frame rate, frame generation and ultrawide, every other setting in a panel, and cloud saves. |
+| 🎞️ **30 or 60 fps** | 60 fps through the SpeedFix code mod, which keeps the island's clock, walking and animations at normal speed. 30 fps is the original game. |
+| ✨ **Frame generation** | MetalFX frame interpolation shows a generated frame between each two the game draws: 60 a second at 30 fps, 120 at 60 fps on a 120 Hz screen. |
+| ↔️ **Ultrawide** | A code mod widens the 3D view to the iPhone's 19.5:9 screen, and the picture is stretched to fill it. |
+| 🧩 **Mod manager** | Import romfs mods (a .zip or a folder) in the app's Mods tab, turn each on or off, and order them; the top one wins. |
+| 🖼️ **Textures for older iPhones** | The game's BC textures are re-encoded to ASTC, EAC and ETC2 ahead of time, so GPUs without BC formats can draw them with no work at run time. |
+| 🪶 **Low memory** | The game's memory pool lives in files iOS can page out (`DM_GUEST_FILE`), so the app stays well under iOS's limit. |
+| 🎁 **DLC** | Add-on content such as Happy Home Paradise is converted and packed with the game. |
+
+## What you need
+
+- Your own dump of **Animal Crossing: New Horizons 3.0.3**: the base game NSP, the 3.0.3 update NSP and any DLC NSPs, in one folder.
+- Your own `prod.keys` (and `title.keys` if your dump needs them), next to the NSPs.
+- A Mac with Xcode to build, and a way to sideload an unsigned IPA (tested with LiveContainer).
+- About **13 GB free** on the iPhone for the game files.
+
+Game files, keys and anything extracted from them stay in your NSP folder. Nothing from the game is in this repository.
+
+## Build it
+
+The commands run from this repository's folder with nxnative's Python environment (see [Requirements](#requirements) below), where `GAME` is your NSP folder.
+
+**1. Extract the game** (the first run of the build script does it):
+
+```bash
+python scripts/build_ipa_from_nsp.py "$GAME" -k "$GAME/prod.keys" --romfs separate
+```
+
+**2. Convert the textures for iPhone.** This makes a new game image whose BC textures are ASTC / EAC / ETC2, checked against the original (lowest PSNR 40 dB):
+
+```bash
+python scripts/bntx_astc.py "<the extracted RomFS.img>" "<RomFS.recode.img>" --eac --floor-psnr 40 --report "$GAME/recode_report.tsv"
+```
+
+Convert each DLC image the same way, put the results in `<title ID>_build/aoc.converted/`, and merge their tables into the game image with `--merge-tables`. Then put the converted image in place of the extracted `RomFS.img`.
+
+**3. Add the code mods** (optional): copy the folders of [`dm/games/01006F8002326000/mods`](dm/games/01006F8002326000/mods/README.md) into a `mods` folder next to your NSPs, and download the 60 fps mod as its README says.
+
+**4. Build the IPA** with an env file holding these three lines:
+
+```text
+DM_GUEST_FILE=1
+DM_BC_RECODE=1
+DM_BC_OPTIONAL=1
+```
+
+```bash
+python scripts/build_ipa_from_nsp.py "$GAME" -k "$GAME/prod.keys" --env-file acnh_env.txt --romfs separate
+```
+
+Set `DM_LAUNCHER_BG` to a picture of your own to give the launcher a background.
+
+**5. Install and copy the game files.** Sideload the IPA, open it once, then copy the game image to the phone with the command the build prints (`scripts/push_romfs.sh`).
+
+## Settings
+
+| Setting | Values | Notes |
+|---|---|---|
+| Frame rate | 30, 60 | 60 turns on the SpeedFix code mod and its data files |
+| Frame Generation | on, off | Doubles the frames shown; on a 120 Hz screen at 60 fps the display runs at 120 Hz |
+| Ultrawide | on, off | Widens the 3D view; menus, the HUD and loading screens stay 16:9, stretched |
+| Picture | Fit, Fill | Fill crops the 16:9 picture to cover the screen (ignored while Ultrawide is on) |
+| Performance HUD | on, off | Frame rate, GPU time, memory and temperature at the top of the screen |
+
+Frame rate and Ultrawide take effect when you press Play.
+
+## Mods
+
+- **Romfs mods** (replaced game files, `<name>/romfs/...`) are added on the phone in the launcher's Mods tab. They load when you press Play, over the game's files.
+- **Code (ExeFS) mods** can't be added on the phone: iOS does not let an app change its own code. They are built into the app ([`dm/tools/exefs_mods.py`](dm/tools/exefs_mods.py)), and a mod with a `dm_toggle.txt` gets a switch: the build embeds a copy of each module it patches for every combination of mods, and the app maps the one your settings call for. See [`dm/games/01006F8002326000/mods`](dm/games/01006F8002326000/mods/README.md).
+
+## Credits
+
+This port stands on a lot of other people's work. Thank you to all of them.
+
+**Code**
+
+| Who | What |
+|---|---|
+| [seedds/nxnative](https://github.com/seedds/nxnative) (MIT) | Everything this port is built on: the NSO rewriter, the Horizon host, NVN on Metal, the iOS app, the build scripts, and the original Animal Crossing profile. Its own acknowledgements are [below](#acknowledgements). |
+| [cheemu21/kid-with-sword-remake](https://github.com/cheemu21/kid-with-sword-remake) (MIT) | Frame generation (MetalFX interpolation on the display link, the motion search `fgmv.metal`, its unit test) and the romfs mod manager (`mods.h`, `mods_zip.h`, `hle_mods.c`, `Mods.swift`) |
+| [jhaizhou-ops/d2r-mobile](https://github.com/jhaizhou-ops/d2r-mobile) (MIT) | The native-execution approach nxnative grew from |
+| [texture2ddecoder](https://github.com/K0lb3/texture2ddecoder) by K0lb3 (MIT) | The BC7 partition and anchor tables in the GPU BC decoder (`bcdec.metal`), and texture decoding in the converter |
+| [astc-encoder-py](https://github.com/K0lb3/astc-encoder-py) by K0lb3 (MIT), wrapping Arm's [ASTC Encoder](https://github.com/ARM-software/astc-encoder) (Apache 2.0) | ASTC encoding in `scripts/bntx_astc.py` |
+| [etcpak](https://github.com/K0lb3/etcpak) by K0lb3 (MIT), wrapping [etcpak](https://github.com/wolfpld/etcpak) by Bartosz Taudul (BSD 3-Clause) | ETC2 and EAC encoding in `scripts/bntx_astc.py` |
+| [NumPy](https://numpy.org) (BSD 3-Clause), [backports.zstd](https://pypi.org/project/backports.zstd/) | The converter's array work and zstd |
+| [Atmosphère](https://github.com/Atmosphere-NX/Atmosphere) | The reference for how a Switch loads IPS code patches (`ldr_patcher`), which the code mod build follows |
+| IPSwitch and [Eden](https://git.eden-emu.dev/eden-emu/eden) | The `.pchtxt` patch format, and how emulators load code placed after a module's text |
+| Apple | Metal, MetalFX, SF Symbols |
+
+**Mods**
+
+| Mod | Author | License |
+|---|---|---|
+| [ACNH 60 FPS + SpeedFix (3.0.X)](https://gamebanana.com/mods/722295) v1.4.5 | **tmouh** | CC BY-NC 4.0. Not redistributed here; this repository has only its switch file. |
+| ACNH 3.0.3 21:9 Ultrawide v2 | not named in its files | MIT No Attribution. Included with its target ratio changed from 43:18 to 19.5:9 for iPhone screens. |
+| [Aspect Ratio Patches (4:3/16:10/21:9/32:9)](https://gamebanana.com/mods/449287), the earlier ACNH aspect-ratio work the ultrawide mod builds on | **theboy181** (original creator), **victoria4dx** (2.0.5 version), **Hyper** (updater), with **OldManKain** (development help) | MIT No Attribution |
+
+**And**
+
+- **Nintendo** made Animal Crossing: New Horizons. This project is not affiliated with or endorsed by Nintendo. Please buy the game and dump your own copy.
+- [LiveContainer](https://github.com/LiveContainer/LiveContainer), which the port was tested in.
+
+---
+
+The rest of this page is nxnative's.
+
+# About nxnative
 
 Play your own Nintendo Switch and Switch 2 games natively on Apple silicon Macs, iPhone and iPad. One script packs your game into a Mac app or an unsigned IPA that you sideload.
 

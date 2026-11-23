@@ -80,6 +80,12 @@ static inline DmLayout dm_layout_picture(DmLayout l, CGRect b, BOOL fill, CGFloa
     if (fill && !l.separated && !CGRectIsEmpty(b)) l.game = dm_aspect_fill(b, aspect);
     return l;
 }
+// Stretch (Ultrawide: DM_ULTRAWIDE=1, a code mod that widens the game's 3D view to the screen): the picture covers the view, its shape changed to the view's (nvn_mtl.m
+// mtl_present_stretch); the split layouts keep it fitted above the controls, as Fill does
+static inline DmLayout dm_layout_stretch(DmLayout l, CGRect b, BOOL stretch) {
+    if (stretch && !l.separated && !CGRectIsEmpty(b)) l.game = b;
+    return l;
+}
 
 // A point in the view as the game's touch screen sees it: normalized on the game rectangle, which with Fill is larger than the view,
 // so a touch on the visible part lands where that part of the picture is. Clamped to [0, 0.999].

@@ -1,0 +1,52 @@
+@nsobid-FF1D1C05670DB6021C85B624A710B963
+// Changed for nxnative on iPhone: the target ratio 43:18 (float 8EE31840) -> 19.5:9 (float ABAA0A40, 2.1667), the iPhone's screen; the picture is stretched to the screen (DM_ULTRAWIDE)
+// Animal Crossing: New Horizons 3.0.3 / 01006F8002326000
+// Experimental 3440x1440 (43:18) perspective patch for Eden desktop.
+// Exact float32 ratio 0x4018E38E. Only native 16:9 perspective cameras change.
+// Set Eden graphics aspect ratio to Stretch to Window and use 3440x1440 fullscreen.
+// This does not reposition or correct the 2D HUD. See README.md.
+@flag offset_shift 0x100
+@flag print_values
+// 3440x1440 perspective correction v2 - Eden loader formatting fix
+@enabled
+// Aspect getter hook
+037E594C 2D851C14
+// Conditional aspect getter
+// Code lives in the executable segment alignment padding; requires Eden-style NSO loading.
+03F06E00 EF43BEA9
+03F06E04 F10B00F9
+03F06E08 0F423BD5
+03F06E0C 10B040B9
+03F06E10 31010018
+03F06E14 1F02116B
+03F06E18 41000054
+03F06E1C F0000018
+03F06E20 0002271E
+03F06E24 0F421BD5
+03F06E28 F10B40F9
+03F06E2C EF43C2A8
+03F06E30 C87AE317
+03F06E34 398EE33F
+03F06E38 ABAA0A40
+// Perspective matrix hook
+037E5968 46851C14
+// Conditional perspective matrix
+// Code lives in the executable segment alignment padding; requires Eden-style NSO loading.
+03F06E80 EF43BEA9
+03F06E84 F10B00F9
+03F06E88 0F423BD5
+03F06E8C 10B040B9
+03F06E90 51010018
+03F06E94 1F02116B
+03F06E98 41000054
+03F06E9C 10010018
+03F06EA0 10B000B9
+03F06EA4 009840BD
+03F06EA8 0F421BD5
+03F06EAC F10B40F9
+03F06EB0 EF43C2A8
+03F06EB4 AE7AE317
+03F06EB8 398EE33F
+03F06EBC ABAA0A40
+
+@stop

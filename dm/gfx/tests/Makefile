@@ -313,6 +313,12 @@ t_readback: t_readback.m $(MTL_T_DEP)
 check_t_readback: t_readback
 	DM_NVN_FAST_WAKE=1 MTL_DEBUG_LAYER=1 ./t_readback
 	DM_NVN_FAST_WAKE=0 MTL_DEBUG_LAYER=1 ./t_readback
+t_framegen: t_framegen.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_framegen.m ../../host/crash.c ../../host/hle_bigstack.c t_host_stubs.c $(filter-out ../nvn/nvn_mtl.m,$(GFX)) $(FW)
+.PHONY: check_t_framegen
+check_t_framegen: t_framegen
+	MTL_DEBUG_LAYER=1 ./t_framegen
+	MTL_DEBUG_LAYER=1 ./t_framegen size
 t_present_crop: t_present_crop.m ../nvn/hle_nvn.c ../../host/crash.c ../../host/hle_bigstack.c t_host_stubs.c $(GFX) $(GFX_H)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_present_crop.m ../../host/crash.c ../../host/hle_bigstack.c t_host_stubs.c $(filter-out ../nvn/nvn_mtl.m,$(GFX)) $(FW)
 .PHONY: check_t_present_crop

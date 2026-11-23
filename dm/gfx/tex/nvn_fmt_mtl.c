@@ -12,6 +12,7 @@ enum {   // MTLPixelFormat
     RGBA16Unorm = 110, RGBA16Snorm = 112, RGBA16Uint = 113, RGBA16Sint = 114, RGBA16Float = 115, RGBA32Uint = 123, RGBA32Sint = 124,
     RGBA32Float = 125, BC1 = 130, BC1_sRGB = 131, BC2 = 132, BC2_sRGB = 133, BC3 = 134, BC3_sRGB = 135, BC4_U = 140, BC4_S = 141,
     BC5_U = 142, BC5_S = 143, BC6H_S = 150, BC6H_U = 151, BC7 = 152, BC7_sRGB = 153,
+    EAC_R11Unorm = 170, EAC_RG11Unorm = 174, EAC_RG11Snorm = 176, ASTC_4x4_HDR = 222,
     ASTC_SRGB0 = 186, ASTC_LDR0 = 204,   // starting at 4x4; 7x? does not exist, so one number is skipped from 8x5 on (see astc_off)
     Depth16Unorm = 250, Depth32Float = 252, Stencil8 = 253, Depth32Float_Stencil8 = 260,
 };
@@ -75,12 +76,29 @@ static const ent T[0x9D] = {
 // NVN ASTC order: 4x4 5x4 5x5 6x5 6x6 8x5 8x6 8x8 10x5 10x6 10x8 10x10 12x10 12x12; Metal skips one number between 6x6 and 8x5
 static const uint8_t astc_off[14] = {0, 1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14};
 
-int nvn_fmt_to_mtl(int f, uint32_t *mtl, uint8_t swz[4]) {
+// A build whose BC4 / BC5 snorm textures were recoded as EAC at pack time (scripts/bntx_astc.py --eac; DM_BC_RECODE=1, set by nvn_mtl.m mtl_init_once): the recoded textures carry
+// a BC format the game never uses otherwise, of the same block size, which makes them EAC here: every Apple GPU reads EAC, so nothing is decoded and nothing grows
+//   BC4_SNORM (0x4a, 8-byte blocks)  → EAC_R11Unorm   (recoded from BC4 unorm)
+//   BC6H_SFLOAT (0x4f, 16-byte blocks) → EAC_RG11Snorm  (recoded from BC5 snorm: the normal maps)
+//   BC2 / DXT3 (0x43, 16-byte blocks)  → EAC_RG11Unorm  (recoded from BC5 unorm; DXT3 is in no file)
+//   BC6H_UFLOAT (0x50, 16-byte blocks) → ASTC_4x4_HDR   (recoded from BC6H ufloat itself, HDR kept: Apple GPUs from the A13 read HDR ASTC; no user-made texture is HDR)
+// EAC R11 / RG11 sample as (r, 0, 0, 1) / (r, g, 0, 1), as BC4 / BC5 do
+static int g_recode;
+void nvn_fmt_set_recode(int on) { g_recode = on; }
+int nvn_fmt_recoded(int f) { return g_recode && (f == 0x4a || f == 0x4f || f == 0x43 || f == 0x50); }
+static uint16_t recoded_mtl(int f) { return f == 0x4a ? EAC_R11Unorm : f == 0x4f ? EAC_RG11Snorm : f == 0x43 ? EAC_RG11Unorm : ASTC_4x4_HDR; }
+
+static int to_mtl(int f, int recode, uint32_t *mtl, uint8_t swz[4]) {
     ent e = {0, 0, 0, 0};
     if (f >= 0x79 && f <= 0x94) { int k = (f - 0x79) % 14; e = (ent){(uint16_t)((f < 0x87 ? ASTC_LDR0 : ASTC_SRGB0) + astc_off[k]), 1, 0, 0}; }
+    else if (recode && nvn_fmt_recoded(f)) e = (ent){recoded_mtl(f), 1, 0, 0};
     else if (f > 0 && f < (int)(sizeof T / sizeof *T)) e = T[f];
     if (mtl) *mtl = e.kind ? e.mtl : 0;
     if (swz) { swz[0] = e.rb ? NVN_SWZ_B : NVN_SWZ_R; swz[1] = NVN_SWZ_G; swz[2] = e.rb ? NVN_SWZ_R : NVN_SWZ_B; swz[3] = e.noalpha ? NVN_SWZ_ONE : NVN_SWZ_A; }
     if (swz && e.rb == 2) { swz[0] = NVN_SWZ_A; swz[1] = NVN_SWZ_B; swz[2] = NVN_SWZ_G; swz[3] = NVN_SWZ_R; }
     return e.kind;
 }
+int nvn_fmt_to_mtl(int f, uint32_t *mtl, uint8_t swz[4]) { return to_mtl(f, 1, mtl, swz); }
+// The format's own Metal format, a marker format's too (DM_BC_RECODE): a texture of the game's own in a format the converter uses as a marker, which the image's side table names
+// as kept (nvn_mtl.m bc_recoded: Animal Crossing's one BC4 snorm texture, in Model/FldUnit)
+int nvn_fmt_to_mtl_own(int f, uint32_t *mtl, uint8_t swz[4]) { return to_mtl(f, 0, mtl, swz); }

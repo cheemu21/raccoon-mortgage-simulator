@@ -307,8 +307,71 @@ static void force_check(void) {
 }
 
 // Read the rewriter table header (segment boundaries, slot numbers); any row beyond the header means an old-format build output (code modified at load time), which is rejected
+// The file name of a module's sections and tables: a switchable code mod's copy (code_mods_pick), else the module's own
+#define MFILE(m) ((m)->file[0] ? (m)->file : (m)->name)
+// Switchable code mods (dm/tools/exefs_mods.py; the launcher's settings turn them on). The app carries each module they patch once per combination of them (gen_embed.py sections
+// __dm<module><letters>x0 …, tables <module><letters>.fixups.tsv …), and code_mods.tsv beside the tables lists them: "mod <letter> <VAR>=<value> <romfs folder> <name>" (letter -
+// and VAR - for an always-on mod) and "variant <module> <letters>". A mod is on when the setting has its value at Play: the iPhone maps the module's code from the signed app and
+// cannot change it later, so main.m loads the modules after the launcher when the app has code mods (no early preload). Each module takes the copy of exactly the mods that are on
+// among those that patch it; DM_CODE_MODS_ROMFS gets the romfs folders of the mods that are on, served over the game's files (hle_fs.c rom_overlay_env)
+static struct { char letter, var[48], val[32], romfs[256], name[96]; int on; } g_cm[32];
+static int g_ncm;
+static struct { char module[16], letters[28]; } g_cmv[64];
+static int g_ncmv;
+static const char *setting_value(const char *var) {   // a setting as the game will see it: the launcher's pick, else the profile's default where there is one
+    const char *v = getenv(var);
+    if (v) return v;
+    if (!strcmp(var, "DM_FPS_TARGET")) { static char d[16]; snprintf(d, sizeof d, "%d", DM_GAME_FPS_TARGET); return d; }
+    return "";
+}
+static void code_mods_load(const char *dir) {
+    char path[1024], line[600], romfs[2048] = ""; snprintf(path, sizeof path, "%s/code_mods.tsv", dir);
+    FILE *f = fopen(path, "r");
+    if (!f) { unsetenv("DM_CODE_MODS_ROMFS"); return; }
+    while (fgets(line, sizeof line, f)) {
+        line[strcspn(line, "\r\n")] = 0;
+        char *t[6] = {0}; int n = 0; for (char *s = line, *e; s && n < 6; s = e ? e + 1 : NULL) { e = strchr(s, '\t'); if (e) *e = 0; t[n++] = s; }
+        if (n >= 5 && !strcmp(t[0], "mod") && g_ncm < (int)(sizeof g_cm / sizeof *g_cm)) {
+            __typeof__(g_cm[0]) *c = &g_cm[g_ncm++];
+            c->letter = strcmp(t[1], "-") ? t[1][0] : 0;
+            char *eq = strchr(t[2], '=');
+            if (eq) { *eq = 0; strlcpy(c->var, t[2], sizeof c->var); strlcpy(c->val, eq + 1, sizeof c->val); }
+            if (strcmp(t[3], "-")) snprintf(c->romfs, sizeof c->romfs, "%s/%s", dir, t[3]);
+            strlcpy(c->name, t[4], sizeof c->name);
+            c->on = !c->letter || (c->var[0] && !strcmp(setting_value(c->var), c->val));
+            if (!c->letter) LOG("code mod %s: always on", c->name);
+            else LOG("code mod %s: %s (on with %s=%s; the setting is %s)", c->name, c->on ? "on" : "off", c->var, c->val, *setting_value(c->var) ? setting_value(c->var) : "unset");
+            if (c->on && c->romfs[0]) { if (romfs[0]) strlcat(romfs, ":", sizeof romfs); strlcat(romfs, c->romfs, sizeof romfs); }
+        } else if (n >= 3 && !strcmp(t[0], "variant") && g_ncmv < (int)(sizeof g_cmv / sizeof *g_cmv)) {
+            strlcpy(g_cmv[g_ncmv].module, t[1], sizeof g_cmv[0].module); strlcpy(g_cmv[g_ncmv].letters, t[2], sizeof g_cmv[0].letters); g_ncmv++;
+        }
+    }
+    fclose(f);
+    if (romfs[0]) { setenv("DM_CODE_MODS_ROMFS", romfs, 1); LOG("code mods: their game files served over the game's: %s", romfs); } else unsetenv("DM_CODE_MODS_ROMFS");
+}
+static void code_mods_pick(module_t *m) {
+    m->file[0] = 0;
+    char want[28] = ""; int k = 0;
+    for (int i = 0; i < g_ncm; i++) {   // the mods that are on among those with a copy of this module, in letter order (the table lists them so)
+        if (!g_cm[i].letter || !g_cm[i].on) continue;
+        int patches = 0; for (int v = 0; v < g_ncmv; v++) if (!strcmp(g_cmv[v].module, m->name) && strchr(g_cmv[v].letters, g_cm[i].letter)) patches = 1;
+        if (patches && k < (int)sizeof want - 1) want[k++] = g_cm[i].letter;
+    }
+    want[k] = 0;
+    if (!k) return;
+    for (int v = 0; v < g_ncmv; v++) if (!strcmp(g_cmv[v].module, m->name) && !strcmp(g_cmv[v].letters, want)) {
+        snprintf(m->file, sizeof m->file, "%s%s", m->name, want);
+        LOG("code mods: %s is mapped from its copy %s", m->name, m->file);
+        return;
+    }
+    LOG("[RED] code mods: no copy of %s with mods %s in this app (code_mods.tsv); the module without them", m->name, want);
+}
+int dm_code_mod_on(const char *var, const char *val) {   // a switchable code mod switched by var=val is on (dm_fps_state_apply: 60 fps through a mod)
+    for (int i = 0; i < g_ncm; i++) if (g_cm[i].letter && g_cm[i].on && !strcmp(g_cm[i].var, var) && !strcmp(g_cm[i].val, val)) return 1;
+    return 0;
+}
 static void read_layout(module_t *m, const char *dir) {
-    char path[1024]; snprintf(path, sizeof path, "%s/%s.fixups.tsv", dir, m->name);
+    char path[1024]; snprintf(path, sizeof path, "%s/%s.fixups.tsv", dir, MFILE(m));
     FILE *f = fopen(path, "r");
     if (!f) die("open %s", path);
     static const char *kn[KEY_N] = {"K18", "KTLS", "KTLR", "KGATE"};
@@ -394,6 +457,8 @@ void dm_fps_state_apply(void) {
     uint32_t unit = g_fstep_t120 ? 120 : 0; __atomic_store_n((uint32_t *)(dm_fps_state + FSTEP_UNIT_OFF), unit, __ATOMIC_RELAXED);
     if (t == 40 && !g_fstep_t120) { LOG("[RED] DM_FPS_TARGET=40: this build's frame step takes whole vsyncs of 1/60 s only (no FRAME_STEP_120 stub), so 25 ms frames cannot be stepped; using 30"); t = 30; }
     if (t != 0 && t != 30 && t != 40 && t != 60) { LOG("[RED] DM_FPS_TARGET=%s: must be 0, 30%s or 60; using the game's own frame step", e, g_fstep_t120 ? ", 40" : ""); t = 0; }
+    // fps_max below 60: the game's logic speeds up above it; a switchable code mod that makes it run at 60 (ACNH's speed fix, loader.c code_mods) lifts that
+    if ((t == 0 || t > DM_GAME_FPS_MAX) && DM_GAME_FPS_MAX < 60 && !(t == 60 && dm_code_mod_on("DM_FPS_TARGET", "60"))) { LOG("DM_FPS_TARGET=%d: this game runs its logic faster above %d fps (profile fps_max); stepping at %d (Frame Generation shows 60)", t, DM_GAME_FPS_MAX, DM_GAME_FPS_MAX); t = DM_GAME_FPS_MAX; }
     nvn_fstep_target_put(dm_fps_state, (float)t);
     // Render scale of the 3D views (the stubs at Tears of the Kingdom's main+0xd5cc0, Breath of the Wild's main+0x1266880, Hades II's render size, Ocarina of Time's view-size
     // update): 1.0 keeps the game's own size and dynamic resolution; another factor fixes the size at that fraction (DM_RENDER_SCALE, 0.5 to the stub's largest scale: 1.0, or
@@ -456,7 +521,7 @@ static void install_key_page(module_t *m) {
 }
 
 static void register_gates(module_t *m, const char *dir) {
-    char path[1024], line[256]; snprintf(path, sizeof path, "%s/%s.gates.tsv", dir, m->name);
+    char path[1024], line[256]; snprintf(path, sizeof path, "%s/%s.gates.tsv", dir, MFILE(m));
     FILE *f = fopen(path, "r");
     int ng = 0;
     if (f) {
@@ -844,7 +909,7 @@ static int nro_pieces(const char *name, const uint8_t **x0, unsigned long *z0, c
 static void map_image(module_t *m, const char *dir) {
     (void)dir;
     char sx0[17], sx1[17], dm[17]; const char *g = embed_tag();
-    snprintf(sx0, sizeof sx0, "__dm%s%sx0", g, m->name); snprintf(sx1, sizeof sx1, "__dm%s%sx1", g, m->name); snprintf(dm, sizeof dm, "__DM%s%sW", g, m->name);
+    snprintf(sx0, sizeof sx0, "__dm%s%sx0", g, MFILE(m)); snprintf(sx1, sizeof sx1, "__dm%s%sx1", g, MFILE(m)); snprintf(dm, sizeof dm, "__DM%s%sW", g, MFILE(m));
     unsigned long z0 = 0, zw = 0, z1 = 0;
     const uint8_t *x0 = NULL, *w = NULL, *x1 = NULL;
     if (m->nro) { if (!nro_pieces(m->name, &x0, &z0, &w, &zw, &x1, &z1)) die("NRO %s: not in the embedded NRO table (__DATA,__dm_nro_tab)", m->name); }
@@ -853,7 +918,7 @@ static void map_image(module_t *m, const char *dir) {
     // The back patch area (patch_nso.py TWO) is a fourth section, __dm<name>x2; NROs never have one (nro_pieces holds three pieces)
     unsigned long z2 = 0; const uint8_t *x2 = NULL;
     if (m->back_len) {
-        char sx2[17]; snprintf(sx2, sizeof sx2, "__dm%s%sx2", g, m->name);
+        char sx2[17]; snprintf(sx2, sizeof sx2, "__dm%s%sx2", g, MFILE(m));
         if (m->nro || !(x2 = getsectiondata(IMAGE_MH, "__TEXT", sx2, &z2)) || z2 != m->back_len || ((uintptr_t)x2 & 0x3FFF)) die("embedded back patch area %s missing or wrong", sx2);
     }
     // Patch area before the base (patch_off < 0): W ends at the end of data (FILE_IMAGE_LEN); bss and the key page are zero pages from vm_allocate and are not in the executable
@@ -888,7 +953,7 @@ static uint8_t *slurp(const char *path, size_t *n) {
 // Seal the code area immediately after copying into anonymous pages (16 KB pages): [0, text_end) and the patch area are read-only+execute, and from then on any write to the code area crashes on the spot;
 // what lies between (ro and data on the same page can only go together) is writable
 static void map_image(module_t *m, const char *dir) {
-    char path[1024]; snprintf(path, sizeof path, "%s/%s.patched.bin", dir, m->name);
+    char path[1024]; snprintf(path, sizeof path, "%s/%s.patched.bin", dir, MFILE(m));
     size_t sz; uint8_t *raw = slurp(path, &sz);
     if (m->patch_off < 0) {
         // Patch area before the base: file = the first part of the image (text + ro + data) + patch area; bss and the key page are anonymous zero pages. The gap from the patch area's end to the base is left inaccessible (PROT_NONE)
@@ -935,6 +1000,8 @@ void load_modules(const char *dir, const char **names, int n) {
     for (int i = 0; i < n; i++) {
         module_t *m = &g_mod[i];
         strlcpy(m->name, names[i], sizeof m->name);
+        if (!i) code_mods_load(dir);
+        code_mods_pick(m);
         read_layout(m, dir);
     }
     create_keys();

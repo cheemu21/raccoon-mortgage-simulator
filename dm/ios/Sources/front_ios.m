@@ -2,6 +2,7 @@
 // is centered (black bars) and the controls are drawn over it; in portrait, or on an iPhone Duo half folded, the picture sits above the controls. With a TV connected the Metal view
 // is on the TV and the phone shows the pad (DmTVSceneDelegate).
 // The host runs on the big-stack thread started by main.m; front_run runs the guest directly on the calling thread.
+#include <mach/mach.h>   // task_info: the performance panel's memory footprint
 #import <UIKit/UIKit.h>
 #import <UserNotifications/UserNotifications.h>
 #import <QuartzCore/CAMetalLayer.h>
@@ -35,6 +36,7 @@ static void front_ios_power_watch(void);
 static void screen_refresh(void);
 static void front_ios_audio_watch(void);
 static UILabel *front_ios_fps_label(void);
+static UILabel *front_ios_hud_label(void);
 
 @interface DmGameView : UIView
 @property (nonatomic) CGFloat maxPixelWidth;   // 0: the screen's own pixels; a TV caps the drawable at 1920 across (tv_attach)
@@ -88,9 +90,11 @@ static void tv_attach(void);
 @property (nonatomic, strong) DmGameView *game;
 @property (nonatomic, strong) UIView *pad;
 @property (nonatomic, strong) UILabel *fps;
+@property (nonatomic, strong) UILabel *hud;   // the host's performance panel (Performance HUD, DM_METAL_HUD): front_ios_hud_label
 @property (nonatomic) BOOL launched;
 @property (nonatomic, strong) id tv;   // the TV scene accessory's registration (iOS 27)
 @property (nonatomic) BOOL fill;   // DM_PICTURE_FIT=fill: in landscape the picture covers the screen, its edges cropped (DmLayout.h dm_layout_picture)
+@property (nonatomic) BOOL stretch;   // DM_ULTRAWIDE=1: in landscape the picture covers the screen, its shape stretched (DmLayout.h dm_layout_stretch)
 @property (nonatomic) BOOL partiallyOpen;   // an iPhone Duo's hinge half open (UIHingeInteraction, iOS 27.1)
 @property (nonatomic) NSInteger hingeStatus;
 @property (nonatomic, copy) NSString *layoutLog;   // the last layout line logged
@@ -168,7 +172,9 @@ static void launcher_done(void) { [g_root startGame]; }
     }
     dm_rotation_set(NULL);   // the launcher's pick (Play put it in the environment), a saved one with DM_LAUNCHER=0, or an env file's
     self.fill = dm_picture_fill(getenv("DM_PICTURE_FIT"));
-    if (self.fill) LOG("front end: picture Fill (DM_PICTURE_FIT=fill), the 16:9 picture covers the screen in landscape and its edges are cropped");
+    { const char *uw = getenv("DM_ULTRAWIDE"); self.stretch = uw && atoi(uw) != 0; }   // Ultrawide: a code mod widened the 3D view to the screen; the picture is stretched to it (DmLayout.h dm_layout_stretch)
+    if (self.stretch) LOG("front end: picture Stretch (DM_ULTRAWIDE=1): the 16:9 picture, its 3D view widened by the code mod, covers the screen in landscape");
+    else if (self.fill) LOG("front end: picture Fill (DM_PICTURE_FIT=fill), the 16:9 picture covers the screen in landscape and its edges are cropped");
     self.view.clipsToBounds = YES;   // with Fill the game view is larger than the screen
     self.view.window.traitOverrides.preferredContentSizeCategory = UIContentSizeCategorySmall;   // UIKit draws the in-game menu (GameMenu.swift) in this window: it keeps one compact text size over the game, whatever the system's text size
     self.game = [[DmGameView alloc] initWithFrame:self.view.bounds];
@@ -182,6 +188,8 @@ static void launcher_done(void) { [g_root startGame]; }
     [self.view addSubview:self.pad];
     const char *fps = getenv("DM_SHOW_FPS");
     [self showFPS:fps ? atoi(fps) != 0 : [[NSBundle.mainBundle objectForInfoDictionaryKey:@"DMShowFPS"] boolValue]];
+    const char *hud = getenv("DM_METAL_HUD");
+    [self showHUD:hud && atoi(hud)];
     [self.view setNeedsLayout]; [self.view layoutIfNeeded];
     UIApplication.sharedApplication.idleTimerDisabled = YES;
     tv_attach();   // a TV connected while the launcher showed
@@ -204,7 +212,8 @@ static void launcher_done(void) { [g_root startGame]; }
     BOOL duoPortrait = b.size.height > b.size.width && (self.hingeStatus != 0 || !CGRectIsNull(division));
     UIEdgeInsets gameInsets = dm_game_safe_insets(b, self.view.safeAreaInsets, duoPortrait);
     BOOL onTV = self.game.superview != self.view;   // the TV's view lays the picture out; the phone is all pad
-    DmLayout layout = onTV ? dm_layout_pad_only(b) : dm_layout_picture(dm_layout(b, gameInsets, self.partiallyOpen, division, g_picture_aspect), b, self.fill, g_picture_aspect);
+    DmLayout layout = onTV ? dm_layout_pad_only(b) : dm_layout_stretch(dm_layout_picture(dm_layout(b, gameInsets, self.partiallyOpen, division, g_picture_aspect), b, self.fill && !self.stretch, g_picture_aspect), b, self.stretch);
+    { void mtl_present_stretch(int); mtl_present_stretch(!onTV && self.stretch && !layout.separated); }   // the picture's shape follows: stretched only where the view is the whole screen
     if (!onTV) self.game.frame = layout.game;
     layout.topSafeOnly = duoPortrait;
     NSString *line = [NSString stringWithFormat:@"%@, hinge %ld%s, divisions %@, picture %@, controls %@", onTV ? @"pad only (picture on the TV)" : layout.separated ? @"split" : self.fill ? @"overlay, Fill" : @"overlay",
@@ -215,8 +224,19 @@ static void launcher_done(void) { [g_root startGame]; }
     if (self.fps) {   // the top row's free stretch: right of DmGamepad.m's L3 key (102 + 17 of its units from the safe edge), level with − / + (22 units down); u is its unit
         CGRect s = CGRectIntersection(layout.controls, UIEdgeInsetsInsetRect(b, gameInsets));
         CGFloat u = layout.separated ? MIN(MIN(s.size.height / 430.0, s.size.width / 700.0), 1.3) : MIN(b.size.height / 430.0, 1.3);
-        self.fps.frame = CGRectMake(floor(CGRectGetMinX(s) + 130 * u), floor(CGRectGetMinY(s) + 22 * u - 11), 64, 22);
+        self.fps.frame = CGRectMake(floor(CGRectGetMinX(s) + (dm_pad_layout() == 3 ? 162 : 130) * u), floor(CGRectGetMinY(s) + 22 * u - 11), 64, 22);   // Life: right of its "…" key (DmGamepad.m K_LIFE_AUX_X)
     }
+    if (self.hud) {   // top centre, under the menu button (22 + 15 of the pad's units down): clear of the side controls (the Life layout's D-pad sits under its drawer on the left) and of Apple's HUD at the top right
+        CGRect s = CGRectIntersection(layout.controls, UIEdgeInsetsInsetRect(b, gameInsets));
+        CGFloat u = layout.separated ? MIN(MIN(s.size.height / 430.0, s.size.width / 700.0), 1.3) : MIN(b.size.height / 430.0, 1.3);
+        CGSize z = [self.hud sizeThatFits:CGSizeMake(320, 80)]; CGFloat w = ceil(z.width) + 16;
+        self.hud.frame = CGRectMake(floor(CGRectGetMidX(s) - w / 2), floor(CGRectGetMinY(s) + 46 * u), w, ceil(z.height) + 8);
+    }
+}
+- (void)showHUD:(BOOL)on {   // the performance panel: DM_METAL_HUD at Play, then the in-game menu. Apple's HUD (developerHUDProperties) shows only when Metal read MTL_HUD_ENABLED
+    // before the process made its first device, which a choice made at Play is too late for and an app run inside another (LiveContainer) never is: this panel shows either way
+    if (on && !self.hud) { self.hud = front_ios_hud_label(); [self.view addSubview:self.hud]; [self.view setNeedsLayout]; }
+    self.hud.hidden = !on;
 }
 - (void)showFPS:(BOOL)on {   // the frame-rate counter: DM_SHOW_FPS at Play, then the in-game menu
     if (on && !self.fps) { self.fps = front_ios_fps_label(); [self.view addSubview:self.fps]; [self.view setNeedsLayout]; }   // above the pad, which hides while a controller is connected
@@ -328,6 +348,7 @@ bool dm_setting_live(const char *env, const char *value) {
     }
     if (!strcmp(env, "DM_ROTATION")) { if (value) dm_rotation_set(value); return true; }
     if (!strcmp(env, "DM_SHOW_FPS")) { if (value) [g_root showFPS:atoi(value) != 0]; return true; }
+    if (!strcmp(env, "DM_METAL_HUD")) { if (value) { [g_root showHUD:atoi(value) != 0]; g_layer.developerHUDProperties = @{@"mode": atoi(value) ? @"default" : @"disabled"}; } return true; }
     if (!strcmp(env, "DM_TOUCH_HAPTICS")) { if (value) dm_gamepad_touch_feedback(atoi(value) != 0); return true; }
     if (!strcmp(env, "DM_RUMBLE")) { if (value) { dm_haptics_set_enabled(atoi(value) != 0); LOG("front end: game rumble %s (in-game menu)", atoi(value) ? "on" : "off"); } return true; }
     return false;
@@ -379,6 +400,32 @@ static UILabel *front_ios_fps_label(void) {
         n0 = n; t0 = now;
     }];
     LOG("front end: frame-rate counter on");
+    return l;
+}
+
+// Performance panel (Performance HUD, DM_METAL_HUD): once a second, the frames put on screen and their average time, the GPU time per frame (every submission's GPUEndTime - GPUStartTime,
+// nvn_mtl.m mtl_gpu_busy_ns: GPU work of overlapping submissions counts once each), the app's memory footprint (what iOS's memory limit counts) and the thermal state
+uint64_t mtl_gpu_busy_ns(void);
+static UILabel *front_ios_hud_label(void) {
+    UILabel *l = [UILabel new];
+    l.font = [UIFont monospacedDigitSystemFontOfSize:12 weight:UIFontWeightSemibold]; l.textColor = UIColor.whiteColor; l.numberOfLines = 2; l.textAlignment = NSTextAlignmentCenter;
+    l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5]; l.layer.cornerRadius = 8; l.layer.masksToBounds = YES; l.userInteractionEnabled = NO;
+    l.text = @"-- fps   -- ms\nGPU -- ms   -- MB";
+    __block uint64_t n0 = mtl_present_count(), g0 = mtl_gpu_busy_ns(); __block double t0 = CACurrentMediaTime();
+    [NSTimer scheduledTimerWithTimeInterval:1.0 repeats:YES block:^(NSTimer *t) {
+        (void)t; uint64_t n = mtl_present_count(), g = mtl_gpu_busy_ns(); double now = CACurrentMediaTime(), dt = now - t0;
+        if (dt < 1.5 && n > n0) {   // a longer span is the time in the background: no reading
+            task_vm_info_data_t vm; mach_msg_type_number_t c = TASK_VM_INFO_COUNT; uint64_t mb = 0;
+            if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vm, &c) == KERN_SUCCESS) mb = vm.phys_footprint >> 20;
+            static NSString *const heat[] = {@"cool", @"warm", @"hot", @"too hot"};
+            NSInteger th = NSProcessInfo.processInfo.thermalState; if (th < 0 || th > 3) th = 0;
+            double f = (double)(n - n0);
+            l.text = [NSString stringWithFormat:@"%.0f fps   %.1f ms\nGPU %.1f ms   %llu MB   %@", f / dt, dt * 1000 / f, (double)(g - g0) / f / 1e6, (unsigned long long)mb, heat[th]];
+            [l.superview setNeedsLayout];
+        }
+        n0 = n; g0 = g; t0 = now;
+    }];
+    LOG("front end: performance panel on (DM_METAL_HUD)");
     return l;
 }
 

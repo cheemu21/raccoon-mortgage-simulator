@@ -10,3 +10,7 @@ enum { NVN_SWZ_ZERO = 0, NVN_SWZ_ONE = 1, NVN_SWZ_R = 2, NVN_SWZ_G = 3, NVN_SWZ_
 //          0 = no Metal counterpart (*mtl is set to 0; handling is in the table comments, mainly expanding 3-component formats to 4 components on upload).
 // swz gives, for each of the four output components r/g/b/a, which source component to take (MTLTextureSwizzleChannels order); may be NULL.
 int nvn_fmt_to_mtl(int nvn_format, uint32_t *mtl_pixel_format, uint8_t swz[4]);
+int nvn_fmt_to_mtl_own(int nvn_format, uint32_t *mtl_pixel_format, uint8_t swz[4]);   // without the DM_BC_RECODE marker mapping
+// DM_BC_RECODE (scripts/bntx_astc.py --eac): BC4_SNORM and BC6H_SFLOAT textures hold EAC blocks, made as EAC_R11Unorm / EAC_RG11Snorm (nvn_fmt_mtl.c)
+void nvn_fmt_set_recode(int on);
+int nvn_fmt_recoded(int nvn_format);

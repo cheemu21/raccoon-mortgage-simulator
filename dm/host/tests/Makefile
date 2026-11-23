@@ -510,3 +510,10 @@ coverage:
 	@$(call cov_export,$(B)/cov)
 # loader.c includes the frame step's header (FSTEP_UNIT_OFF, nvn_fstep_target_put)
 $(B)/t_symbols $(B)/t_nro: ../../gfx/nvn/nvn_fstep.h
+# mods.h / mods_zip.h: the overlay list DM_MODS makes, the merged size table, the zip import (uses zip(1) and ditto, which every Mac has; zstd where installed)
+run: $(B)/t_mods
+$(B)/t_mods: t_mods.c ../mods.h ../mods_zip.h ../romfs_image.h | $(B)
+	$(CLANG) -O1 -g -Wall -Wextra -Werror -I.. -o $@ t_mods.c -lcompression
+.PHONY: mods
+mods: $(B)/t_mods
+	TMPDIR="$(abspath $(B))" $(B)/t_mods

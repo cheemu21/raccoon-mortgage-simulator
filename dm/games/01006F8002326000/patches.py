@@ -225,8 +225,36 @@ def screen_shape(ctx):
 
 
 
+# Frame rate (fps_target 30; the launcher's Frame rate 30 / 60, 60 experimental). The game sets its present interval once per scene, not per frame: the scene manager
+# (main+0x357d660) makes a frame controller for the new scene and main+0x357c6d0 asks it (vtable +0x28) for the interval, puts it in the window (nvnWindowSetPresentInterval through the
+# slot main+0x4acf5a8, main+0x357c754) and the framework (+0xa0). The stub at the return of that call (main+0x357c730) hands the scene 1 vsync per frame when the target is 60 and the
+# controller's own interval otherwise, and publishes the scene's interval as the step the game fixes itself (state +0x24), so the host holds each frame exactly that long (as for
+# Breath of the Wild's VFR override) and does not pick steps the game would not follow. Open: whether the island's simulation follows the interval (nothing found that reads the
+# framework's +0xa0 directly); at 60 the player checks the game's speed. w9, x16 and x17 are free there (w9 is loaded again at main+0x357c760 before any read)
+def frame_rate(ctx):
+    here, emit = ctx.here, ctx.emit
+    ctx.site(0x357c730, 'e8ae40f9')
+    start = here(); emit(ADRP(16, here(), ctx.state))
+    for w in (0xb9400211,   # ldr w17,[x16]          target fps (float; 0 = off)
+              0x340000d1,   # cbz w17,orig (+6)
+              0x52a84e09,   # mov w9,#0x42700000     60.0
+              0x6b09023f,   # cmp w17,w9
+              0x54000041,   # b.ne pub (+2)
+              0x52800020,   # mov w0,#1              60: one vsync per frame
+              0xb9002600,   # pub: str w0,[x16,#0x24]  the scene's interval: the host holds frames that long
+              0xf940aee8):  # orig: ldr x8,[x23,#0x158]
+        emit(w)
+    emit(B(here(), 0x357c734))
+    ctx.put(0x357c730, [B(0x357c730, start)], "scene frame controller's interval: 1 at 60 fps, published as the game's own step (state page target fps; 0 = original)")
+    ctx.step_max = 3
+
+
+def frame_step(ctx):
+    screen_shape(ctx); frame_rate(ctx)
+
+
 FRAME_STEP = {
-    'ff1d1c05670db6021c85b624a710b963': screen_shape,   # 3.0.3 (v2228224) main
+    'ff1d1c05670db6021c85b624a710b963': frame_step,   # 3.0.3 (v2228224) main: the screen shape stubs and the frame rate stub
 }
 
 # How general each patch is and could be (dm/tools/docs_patches.py "Binding", listed in docs/agents/game-patches.md): what, its binding now, the loosest it could have (goal),

@@ -15,7 +15,9 @@
 #   label, note  the setting's name and the line under it (may be empty; only for a setting with a cost: latency, memory, heat)
 #   meta      optional, key=value pairs separated by ; (settings.py META lists the keys; docs/frontends.md, The settings list, describes them):
 #             level=basic  a setting a front end shows first;  needs=<VAR>=<value>  a sub-setting, drawn only while the row that sets <VAR> has that value
-DM_FPS_TARGET	choice	30=30 fps,40=40 fps?fixups:FRAME_STEP_120,60=60 fps,120=120 fps?DM_GAME_FPS_MAX==120	DM_GAME_FPS_TARGET	DM_GAME_FPS_TARGET!=0	Game	Frame rate		level=basic
+DM_FPS_TARGET	choice	30=30 fps,40=40 fps?fixups:FRAME_STEP_120&DM_GAME_FPS_MAX!=30,60=60 fps?DM_GAME_FPS_MAX!=30|codemod:DM_FPS_TARGET=60,120=120 fps?DM_GAME_FPS_MAX==120	DM_GAME_FPS_TARGET	DM_GAME_FPS_TARGET!=0	Game	Frame rate		level=basic
+DM_FRAMEGEN	toggle	-	0	gfxapi:nvn	Game	Frame Generation	Shows twice the frames the game draws: MetalFX makes a frame between each two (60 a second at 30 fps; 120 at 60 fps on a 120 Hz screen). More input delay than drawing them all; fast motion can smear.
+DM_ULTRAWIDE	toggle	-	0	codemod:DM_ULTRAWIDE=1	Game	Ultrawide	Widens the game's 3D view to the screen's shape and stretches the picture to fill it (a code mod built into this app). Menus, the HUD and loading screens keep their 16:9 layout, stretched.
 DM_DYNAMIC_RESOLUTION	toggle	-	0	fixups:DYNAMIC_RESOLUTION	Game	Dynamic resolution	Lets the game lower its resolution under load. Turn off to keep full resolution for the selected console mode.
 DM_RENDER_SCALE	range	0.5:1.0:0.05	1.0	fixups:RENDER_SCALE	Game	Render scale		level=basic
 DM_OPMODE	choice	1=Docked,0=Handheld	DM_GAME_OPMODE	always	Game	Console mode		level=basic

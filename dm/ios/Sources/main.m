@@ -116,6 +116,8 @@ const char *front_ios_device_check(void) {
     if (done++) return msg[0] ? msg : NULL;
     id<MTLDevice> gpu = MTLCreateSystemDefaultDevice();   // the system default device, the one the graphics layers take (mtl_init repeats this check for the other routes)
     if (gpu.supportsBCTextureCompression) return NULL;
+    const char *opt = getenv("DM_BC_OPTIONAL");   // a build with re-encoded textures (scripts/bntx_astc.py): GPUs without BC run it (nvn_mtl.m tex_desc leaves out a BC texture left)
+    if (opt && *opt && strcmp(opt, "0")) { fprintf(stderr, "boot: %s has no BC textures; this build's are re-encoded (DM_BC_OPTIONAL)\n", gpu ? gpu.name.UTF8String : "the GPU"); return NULL; }
     snprintf(msg, sizeof msg, "This device's GPU (%s) cannot read BC-compressed textures, which the games use. It needs an iPhone 15 Pro or newer (A17 Pro chip or later) or an iPad with an M1 chip or later.",
              gpu ? gpu.name.UTF8String : "no Metal device");
     fprintf(stderr, "[RED] boot: %s\n", msg);
@@ -203,7 +205,10 @@ static int boot_env(void) {
     if ([fm fileExistsAtPath:pso]) setenv("DM_PSO_BUNDLE", pso.fileSystemRepresentation, 0);
     chdir(doc.fileSystemRepresentation);
     g_argv[0] = strdup("dmhost"); g_argv[1] = strdup(dm.fileSystemRepresentation); g_argc = 2;
-    dm_host_preload_start(g_argc, g_argv);   // Module tables / relocation / takeover run early in the background, in parallel with UIKit startup (and the launcher: the settings it sets are read when the game starts)
+    // Module tables / relocation / takeover run early in the background, in parallel with UIKit startup (and the launcher: the settings it sets are read when the game starts). Not in an
+    // app with switchable code mods (loader.c code_mods): which copy of a module is mapped follows the launcher's settings, so the modules load after Play (about 0.1 s)
+    if ([fm fileExistsAtPath:[dm stringByAppendingPathComponent:@"code_mods.tsv"]]) fprintf(stderr, "boot: code mods in this app: the modules load after the launcher\n");
+    else dm_host_preload_start(g_argc, g_argv);
     return 1;
 }
 
@@ -237,6 +242,13 @@ static NSString *program_env(void) {
     if (!romfs) return nil;
     fprintf(stderr, "boot: game files %s\n", romfs.fileSystemRepresentation);
     setenv("DM_ROMFS", romfs.fileSystemRepresentation, 0);
+    {   // Mods (Documents/mods, Mods.swift): the launcher sets DM_MODS at Play. A size table merged for them goes in Documents/mods/.merged (hle_fs.c rom_overlay_env, mods.h), only for a
+        // build that stored the game's table uncompressed (DM_MODS_RSTB); without one a mod's own copy of the table is served, as Switch mod loaders do
+        NSString *doc = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES)[0];
+        NSString *rstb = [dmdir stringByAppendingPathComponent:@"mods_rstb.bin"];
+        if ([fm fileExistsAtPath:rstb]) setenv("DM_MODS_RSTB", rstb.fileSystemRepresentation, 0);
+        setenv("DM_MODS_WORK", [doc stringByAppendingPathComponent:@"mods/.merged"].fileSystemRepresentation, 0);
+    }
     // The RomFS of the application's other programs (scripts/pack_nup.py, a Switch 2 Edition's Switch 1 program), which the game mounts by program index (hle_fs.c): in the app beside its
     // RomFS, also when that RomFS is Documents/romfs.img
     NSString *sib = [(prog ? [NSBundle.mainBundle.resourcePath stringByAppendingPathComponent:prog] : NSBundle.mainBundle.resourcePath) stringByAppendingPathComponent:@"romfs_programs"];

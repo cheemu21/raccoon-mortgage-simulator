@@ -65,6 +65,8 @@ def build(gid, patched, control, other_programs=()):
     g = game.load(gid)
     macros = dict(re.findall(r'^#define (DM_GAME_\w+) (.*)$', game.header_one(g), re.M))   # the host's own defaults, as it is compiled for this game
     keys = fixups_keys(Path(patched) / 'main.fixups.tsv')
+    cm = Path(patched) / 'code_mods.tsv'   # the build's switchable code mods (dm/tools/exefs_mods.py): the settings that turn them on, VAR=value
+    codemods = {l.split('\t')[2] for l in cm.read_text(encoding='utf-8').splitlines() if l.startswith('mod\t') and l.split('\t')[1] != '-'} if cm.is_file() else set()
     mac_mic = platform == 'mac' and nso_syms.audio_input_capable(
         p for folder in (patched, *other_programs) for p in Path(folder).glob('*.patched.bin'))
     have = nacp.languages(control)
@@ -81,6 +83,7 @@ def build(gid, patched, control, other_programs=()):
         if cond.startswith('fixups:'): return cond[7:] in keys
         if cond.startswith('gfxapi:'): return os.environ.get('GFXAPI', '') == cond[7:]
         if cond.startswith('platform:'): return platform == cond[9:]
+        if cond.startswith('codemod:'): return cond[8:] in codemods   # a switchable code mod is built in for VAR=value (code_mods.tsv)
         m = re.fullmatch(r'(DM_GAME_\w+)(!=|==)(.*)', cond)
         if m: return (macro(m[1], n) == m[3]) == (m[2] == '==')
         sys.exit(f'settings.tsv:{n}: unknown condition {cond}')
@@ -101,9 +104,9 @@ def build(gid, patched, control, other_programs=()):
         if kind == 'choice' and values != 'languages': return {v.split('?', 1)[0].split('=', 1)[0] for v in values.split(',')}
         return None
 
-    def offered(v, n):   # value=label?cond&cond: an option only some games or platforms have
+    def offered(v, n):   # value=label?cond&cond|cond: an option only some games or platforms have (& binds tighter than |)
         parts = v.split('?', 1)
-        return len(parts) == 1 or all(shown(c, n) for c in parts[1].split('&'))
+        return len(parts) == 1 or any(all(shown(c, n) for c in alt.split('&')) for alt in parts[1].split('|'))
 
     out, table, base = [], {r[1][0]: takes(r[1][1], r[1][2]) for r in rows()}, render_base(g)
     for n, (var, kind, values, default, cond, section, label, note, extra) in rows():

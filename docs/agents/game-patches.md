@@ -55,7 +55,7 @@ Every patch bound tighter than it could be: the open gaps, then the blocked, kep
 
 | Game | Cuts | Gates | Frame-step and stub sites | Function-matched rules | Host rows | Binding |
 |---|---|---|---|---|---|---|
-| [Animal Crossing: New Horizons](#animal-crossing-new-horizons) | 0 | 0 | 14 | 0 | 0 | `build` → `game` |
+| [Animal Crossing: New Horizons](#animal-crossing-new-horizons) | 0 | 0 | 15 | 0 | 0 | `build` → `game` |
 | [ASTRAL CHAIN](#astral-chain) | 0 | 0 | 112 | 0 | 0 | `build` → `game` |
 | [Batman: Arkham Knight](#batman-arkham-knight) | 8 | 0 | 0 | 0 | 1 | `build` → `game` ×2 |
 | [Catherine: Full Body](#catherine-full-body) | 0 | 0 | 0 | 1 | 0 | `game` |
@@ -102,8 +102,8 @@ Every patch bound tighter than it could be: the open gaps, then the blocked, kep
 
 - **`build` → `game`**, rendering, blocked: the stubs have no function-matched form yet, judgement: screen shape: the sizes, the view, the layouts' projection and their edge widgets (DM_SCREEN_ASPECT). The output size is the host's, but where the game takes its sizes, its cameras and its layouts are this build's code
 
-- **3.0.3 `main`** `ff1d1c05…` ([patches.py:229](../../dm/games/01006F8002326000/patches.py#L229))
-  <details><summary>14 frame-step sites</summary>
+- **3.0.3 `main`** `ff1d1c05…` ([patches.py:257](../../dm/games/01006F8002326000/patches.py#L257))
+  <details><summary>15 frame-step sites</summary>
 
   - frame step `+0x265140`: nn::ui2d::DrawInfo::SetProjectionMtx: the y row divided by the vertical stretch, layouts in their own shape (bit 6)
   - frame step `+0x27d570`: nn::ui2d::Pane::Calculate after the global matrix: duo_calc (the HUD at the taller screen's edges, full-screen backgrounds stretched)
@@ -118,6 +118,7 @@ Every patch bound tighter than it could be: the open gaps, then the blocked, kep
   - frame step `+0x1527f2c`: resolution table entry of the frame (crop, render scale): the height of the screen's shape (bit 7)
   - frame step `+0x31cee60`: layouts' DrawInfo: the framebuffer's size in the screen's shape (bit 8)
   - frame step `+0x31cee9c`: layouts' DrawInfo: the framebuffer's size in the screen's shape (bit 8)
+  - frame step `+0x357c730`: scene frame controller's interval: 1 at 60 fps, published as the game's own step (state page target fps; 0 = original)
   - frame step `+0x386a7a0`: game camera: the vertical angle widened so the taller screen keeps 16:9's sides (bit 5)
 
   </details>

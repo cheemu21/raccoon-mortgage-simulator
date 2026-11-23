@@ -1569,6 +1569,19 @@ def stage_external_dlc(work, source):
     return out if images else None
 
 
+def aoc_converted(work, dst, kf, key):
+    """<id>_build/aoc.converted/<index>.img in place of the extracted ones: DLC images whose textures scripts/bntx_astc.py --eac converted for GPUs without BC formats (their BC1
+    fingerprints and ASTC copies merged into the game image's tables with --merge-tables). Copied with their times, and the reuse key written again after, so the next build keeps them"""
+    ov = work / 'aoc.converted'
+    if not ov.is_dir(): return 0
+    n = 0
+    for p in sorted(ov.glob('*.img')):
+        q = dst / p.name; a = p.stat()
+        if not q.exists() or q.stat().st_size != a.st_size or q.stat().st_mtime_ns != a.st_mtime_ns: shutil.copy2(p, q); n += 1
+    if n: kf.write_text(f'{fingerprint(key, ("stat", dst))}\n{kf.read_text().splitlines()[1] if kf.exists() and len(kf.read_text().splitlines()) > 1 else ""}\n')
+    return len(list(ov.glob('*.img')))
+
+
 def extract_aoc(nx, keys, repo, work, app, fam, logs):
     """DLC NSPs in the folder → <id>_build/aoc/<index>.img (the RomFS of each one's data NCA; index = title ID − base − 0x1000, base the application's title ID even for one of its programs,
     app + N, whose DLC are the application's). The host reports these indices as owned and mounts them (DM_AOC_DIR).
@@ -1598,7 +1611,8 @@ def extract_aoc(nx, keys, repo, work, app, fam, logs):
     base = app & ~0xFFF   # a program (--program N, or one a launcher's build packs) is app + N: its DLC are numbered from the application, as the game asks for them
     if base != app: key = fingerprint(key, 'indices from the application')   # a program's aoc/ numbered from its own title ID before is made again
     if dst.is_dir() and (note := reused(kf, fingerprint(key, ('stat', dst)))) is not None:
-        PROG.end(f'{note}, reused (inputs unchanged)'); return dst
+        c = aoc_converted(work, dst, kf, key)
+        PROG.end(f'{note}, reused (inputs unchanged)' + (f'; {c} converted for the iPhone (aoc.converted)' if c else '')); return dst
     rmtree(kf)
     for i, (tid, (_, p)) in enumerate(sorted(best.items())):
         idx = tid - base - 0x1000
@@ -1607,7 +1621,8 @@ def extract_aoc(nx, keys, repo, work, app, fam, logs):
         run([nx, keys, '--aoc', p, tmp / f'{idx}.img', '--romfs-image', f'{tid:016x}'], logs / f'aoc_{idx}.log')   # the DLC by its content meta's title ID: a merged package holds several
     swap_in(tmp, dst)
     kf.write_text(f'{fingerprint(key, ("stat", dst))}\n{len(best)} DLC\n')
-    PROG.end(f'{len(best)} DLC')
+    c = aoc_converted(work, dst, kf, key)
+    PROG.end(f'{len(best)} DLC' + (f', {c} converted for the iPhone (aoc.converted)' if c else ''))
     return dst
 
 
@@ -1691,13 +1706,26 @@ def rewrite(py, repo, exe_dir, out, env, logs, g, provisional=False):
     mods = g.modules_in(exe_dir)   # a version may lack a module of the profile another version has (game.py build_modules)
     manifest = nro_dir / 'nro.tsv'
     src = {m: exe_dir / m for m in mods} | nros
+    # ExeFS (code) mods (dm/tools/exefs_mods.py): IPS / IPS32 / .pchtxt patches of the game's own modules, by build ID. An always-on mod is patched into the module the rewriter takes;
+    # a switchable one (dm_toggle.txt: a launcher setting's value) makes copies, rewritten as <module><letters> (maina, mainab), all embedded, the one for the settings mapped at Play
+    # (loader.c code_mods). Their build ID is the module's own, so the profile's cuts apply to each, and a cut over a patched instruction stops the rewrite on its original-bytes check
+    emods = [d for d in (env.get('DM_EXEFS_MODS') or '').split(os.pathsep) if d]
+    efp, cplan, vmod = '', None, {}   # vmod: copy name -> the module it is a copy of
+    if emods:
+        sys.path.insert(0, str(repo / 'dm/tools')); import exefs_mods
+        try: cplan = exefs_mods.plan(emods, {m: exe_dir / m for m in mods}, out.with_name(out.name + '.exefs_mods'))
+        except ValueError as e: raise BuildError(f'ExeFS mods: {e}') from None
+        src.update(cplan.base); efp = cplan.fingerprint
+        for m, letters, f in cplan.variants: src[m + letters] = f; vmod[m + letters] = m
+        for l in cplan.lines: PROG.say(f'ExeFS mod: {l}')
+        if not cplan.mods: PROG.say(f'ExeFS mods: none for this build in {", ".join(emods)}')
     names = list(src)
     kf = out.with_name(out.name + '.key')
     # the repository profile's build rows decide which builds the rewriter treats as the game's own (SDK-wide function patches skip those), and its snowdrop_pools the sizes of those cuts, so they are inputs too
     try: own = [l for l in (repo / 'dm/games' / Path(env.get('DM_GAME') or '-').name / 'game.tsv').read_text(encoding='utf-8').splitlines() if l.startswith(('build\t', 'snowdrop_pools\t'))]
     except OSError: own = []
-    key = fingerprint(('files', [repo / 'dm/tools' / f for f in ('patch_nso.py', 'jump_solver.py', 'nso.py', 'mod_layout.py', 'nso_code.py', 'nso_asm.py', 'nso_syms.py', 'nso_match.py', 'ue_cvar.py', 'ue_malloc.py', 'ue_region.py', 'ue_ring.py', 'snowdrop_pools.py', 'loader_census.py', 'fps_target.py', 'monolith_fps.py', 'ue_fixed_rate.py', 'unity_fps.py', 'unity_bucket.py')] + patch_files(repo, exe_dir, mods, env.get('DM_GAME')) + list(src.values()) + ([manifest] if manifest.is_file() else [])), names, capstone.__version__,
-                      {k: env.get(k) for k in ('DM_PATCH_FRONT', 'DM_GAME')}, own)
+    key = fingerprint(('files', [repo / 'dm/tools' / f for f in ('patch_nso.py', 'jump_solver.py', 'nso.py', 'mod_layout.py', 'nso_code.py', 'nso_asm.py', 'nso_syms.py', 'nso_match.py', 'ue_cvar.py', 'ue_malloc.py', 'ue_region.py', 'ue_ring.py', 'snowdrop_pools.py', 'loader_census.py', 'fps_target.py', 'monolith_fps.py', 'ue_fixed_rate.py', 'unity_fps.py', 'unity_bucket.py', 'exefs_mods.py')] + patch_files(repo, exe_dir, mods, env.get('DM_GAME')) + list(src.values()) + ([manifest] if manifest.is_file() else [])), names, capstone.__version__,
+                      {k: env.get(k) for k in ('DM_PATCH_FRONT', 'DM_GAME')}, own, efp)
     if all((out / f'{m}.patched.bin').is_file() for m in names) and reused(kf, key) is not None:
         PROG.end(f'{", ".join(mods)}{f" and {len(nros)} NROs" if nros else ""}, reused (inputs unchanged)')
         return capture_nro(py, repo, exe_dir, out, nro_dir, env, logs, g, provisional)
@@ -1711,7 +1739,9 @@ def rewrite(py, repo, exe_dir, out, env, logs, g, provisional=False):
         while todo or procs:
             while todo and len(procs) < cores:
                 m = todo.pop(0); logf[m] = open(logs / f'rewrite_{m}.log', 'w')
-                procs[m] = subprocess.Popen([str(py), str(repo / 'dm/tools/patch_nso.py'), str(src[m]), str(tmp), m], env=rewrite_env, stdout=logf[m], stderr=subprocess.STDOUT)
+                vdir = tmp / f'.copy_{m}' if m in vmod else tmp   # a code mod's copy: rewritten as its module (its cuts are the module's), renamed when done
+                if m in vmod: vdir.mkdir(parents=True, exist_ok=True)
+                procs[m] = subprocess.Popen([str(py), str(repo / 'dm/tools/patch_nso.py'), str(src[m]), str(vdir), vmod.get(m, m)], env=rewrite_env, stdout=logf[m], stderr=subprocess.STDOUT)
             for m in [m for m in procs if procs[m].poll() is not None]:
                 p = procs.pop(m); logf[m].close(); PROG.set(done=len(names) - len(todo) - len(procs))
                 if p.returncode:
@@ -1724,6 +1754,12 @@ def rewrite(py, repo, exe_dir, out, env, logs, g, provisional=False):
         for p in procs.values():
             if p.poll() is None: p.terminate(); p.wait()
         for f in logf.values(): f.close()
+    for v, m in vmod.items():   # <module>.* of a copy's folder -> <copy>.*
+        vdir = tmp / f'.copy_{v}'
+        for f in vdir.iterdir():
+            if f.name.startswith(m + '.'): f.rename(tmp / (v + f.name[len(m):]))
+        rmtree(vdir)
+    if cplan: exefs_mods.write_table(cplan, tmp)   # code_mods.tsv and the switchable mods' romfs (build_ipa.sh puts them in the app)
     rmtree(kf); swap_in(tmp, out); kf.write_text(f'{key}\n')
     PROG.end(', '.join(mods) + (f' and {len(nros)} NROs' if nros else ''))
     return capture_nro(py, repo, exe_dir, out, nro_dir, env, logs, g, provisional)
@@ -3267,6 +3303,8 @@ def parse_args(argv):
                     'it must be one the game supports, which the console lists')
     ap.add_argument('--keep-extracted', action=argparse.BooleanOptionalAction, help='keep the extracted game files after the IPA is built, for the next build (default: the KEEP_EXTRACTED setting, on)')
     ap.add_argument('--work-dir', help='the game\'s build folder, used as it is (default: the WORK_DIR setting, else <title ID>_build in the NSP folder); the extracted files, shader cache and temporary files live there, and the IPA or Mac app defaults to the folder holding it')
+    ap.add_argument('--exefs-mods', help='folders of ExeFS (code) mods, separated by ":": <mod>/exefs/<build ID>.ips | .pchtxt, or Atmosphère\'s exefs_patches/<mod>/<build ID>.ips. Applied before the rewrite '
+                    '(dm/tools/exefs_mods.py), so they are part of the build: the iPhone cannot load code at run time. Default: the NSP folder\'s mods/ and exefs_patches/ where they exist; "" for none')
     ap.add_argument('--env-file', help='environment switches for a diagnostic build (one KEY=VALUE per line)')
     ap.add_argument('--gpu', help='NVN games: GPU architectures the app gets its pipeline archive for, made on this Mac with metal-tt, comma-separated: g18p (A19 / A19 Pro), or the name a device\'s log gives when the app has no archive for its GPU; '
                     'none = no archive, the device builds the bases on its first start (default: the PSO_GPUS setting; when that is empty, a profile with pso_mtl4 on uses its pso_gpu key or g18p, and other profiles use none). '
@@ -3520,6 +3558,9 @@ def main(args=None):
         if derived: say(f'{derived}: packing {pkg_ver} from a profile derived from it')
     versions = [pkg_ver] if derived else need + ([pkg_ver] if pkg_ver not in need else [])
     work = build_folder(args, nsp_dir, g.id); BUILD_FOLDERS.add(work)
+    # ExeFS (code) mods: patched into the modules before the rewrite (rewrite, dm/tools/exefs_mods.py)
+    emods = args.exefs_mods if getattr(args, 'exefs_mods', None) is not None else os.pathsep.join(str(d) for d in (nsp_dir / 'mods', nsp_dir / 'exefs_patches') if d.is_dir())
+    env['DM_EXEFS_MODS'] = emods.replace(':', os.pathsep)
     out_ipa = Path(os.path.expanduser(args.out or OUT_IPA)).resolve() if (args.out or OUT_IPA) else work.parent / g.get('ipa')   # by default next to the build folder (the NSP folder, beside the NSPs and <id>_build/, unless --work-dir moved it)
     if shadowed and not (args.out or OUT_IPA): out_ipa = out_ipa.with_name(out_ipa.stem + '-provisional.ipa')   # never over the IPA of the game's real profile
     if mac_pack and (args.out or OUT_IPA) and out_ipa.suffix != '.app': raise BuildError(f'the Mac app (-o / OUT_IPA) must end in .app: {out_ipa}')
